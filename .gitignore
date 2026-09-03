@@ -5,3 +5,4 @@ __pycache__/
 venv/
 *.pt
 uploads/
+debug_output/

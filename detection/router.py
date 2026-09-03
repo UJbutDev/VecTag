@@ -1,6 +1,7 @@
 import shutil
 import uuid
 import os
+import cv2
 from datetime import datetime
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 
@@ -14,7 +15,12 @@ from detection.db import get_all_reference_plates, camera_exists, insert_detecti
 router = APIRouter()
 
 UPLOAD_DIR = "uploads"
+DEBUG_DIR = "debug_output"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(DEBUG_DIR, exist_ok=True)
+
+# Set False once you're done tuning — saves a crop + processed image per scan
+SAVE_DEBUG_IMAGES = True
 
 
 @router.post("/scan")
@@ -26,7 +32,6 @@ async def scan_plate(
     if not camera_exists(camera_id):
         raise HTTPException(status_code=400, detail="invalid camera_id")
 
-    # Save uploaded image temporarily
     temp_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}_{image.filename}")
     with open(temp_path, "wb") as f:
         shutil.copyfileobj(image.file, f)
@@ -35,9 +40,15 @@ async def scan_plate(
     if plate_crop is None:
         return {"error": "no_plate_detected"}
 
-    processed = preprocess_plate(plate_crop)
-    raw_text, confidence = run_ocr(processed)
+    if SAVE_DEBUG_IMAGES:
+        cv2.imwrite(os.path.join(DEBUG_DIR, f"crop_{image.filename}"), plate_crop)
 
+    processed = preprocess_plate(plate_crop)
+
+    if SAVE_DEBUG_IMAGES:
+        cv2.imwrite(os.path.join(DEBUG_DIR, f"processed_{image.filename}"), processed)
+
+    raw_text, confidence = run_ocr(processed)
     if not raw_text:
         return {"error": "no_plate_detected"}
 
