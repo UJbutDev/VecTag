@@ -9,25 +9,29 @@ def preprocess_plate(plate_img):
     """
     gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
 
-    # Resize up so OCR has more pixels to work with.
-    # Bumped from 3x to 4x since crops are now tight, small plate-only regions
-    # (previously the crop included the whole car front, so less zoom was needed).
     scale = 4
     resized = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
-    # Slight blur to reduce noise before thresholding — helps avoid
-    # jagged/broken character strokes on the upscaled image.
     blurred = cv2.GaussianBlur(resized, (3, 3), 0)
 
-    # Contrast enhancement
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(blurred)
 
-    # Otsu's threshold instead of adaptive threshold — picks the split point
-    # automatically based on the image's histogram. Plates are naturally
-    # high-contrast (dark text on light background), and now that the crop
-    # is tight and small, Otsu tends to give cleaner, less wavy character
-    # edges than adaptive threshold, which was tuned for a much larger frame.
-    _, thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Adaptive threshold, not Otsu — Otsu applies one global cutoff, which
+    # turns any stray border/shadow/frame noise into a solid black blob
+    # indistinguishable from a character. Adaptive threshold judges each
+    # region locally, which handles uneven lighting (shadows, glare, rain
+    # streaks) more gracefully. Smaller block size (15) than before (31)
+    # since the crop is now a small, tight plate-only region.
+    thresh = cv2.adaptiveThreshold(
+        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 15, 8
+    )
 
-    return thresh
+    # Morphological opening: erodes away small stray blobs (border bits,
+    # dust, screw glare) that survived thresholding, without eating into
+    # solid character strokes.
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+    cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    return cleaned

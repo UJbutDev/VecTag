@@ -9,6 +9,12 @@ import os
 _MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "plate_detector.pt")
 _model = YOLO(_MODEL_PATH)
 
+# Shrinks the detected box inward by this fraction on each side before
+# cropping. YOLO boxes tend to land right at (or slightly past) the plate
+# edge, catching the frame/holder/screws. Trimming a small margin removes
+# that border noise without cutting into real characters.
+_MARGIN_TRIM = 0.05  # 5% inward on each side
+
 
 def detect_plate_region(image_path: str):
     """
@@ -25,12 +31,28 @@ def detect_plate_region(image_path: str):
     boxes = results[0].boxes
 
     if boxes is not None and len(boxes) > 0:
-        # Take the box with highest confidence
         best = boxes[boxes.conf.argmax()]
         x1, y1, x2, y2 = map(int, best.xyxy[0])
+        x1, y1, x2, y2 = _trim_margin(x1, y1, x2, y2, img.shape)
         return img[y1:y2, x1:x2]
 
     return _contour_fallback(img)
+
+
+def _trim_margin(x1, y1, x2, y2, img_shape):
+    h_img, w_img = img_shape[:2]
+    box_w = x2 - x1
+    box_h = y2 - y1
+
+    dx = int(box_w * _MARGIN_TRIM)
+    dy = int(box_h * _MARGIN_TRIM)
+
+    x1 = max(0, x1 + dx)
+    y1 = max(0, y1 + dy)
+    x2 = min(w_img, x2 - dx)
+    y2 = min(h_img, y2 - dy)
+
+    return x1, y1, x2, y2
 
 
 def _contour_fallback(img):
@@ -45,7 +67,7 @@ def _contour_fallback(img):
         if len(approx) == 4:
             x, y, w, h = cv2.boundingRect(approx)
             aspect_ratio = w / float(h)
-            if 2 < aspect_ratio < 6:  # plausible plate shape
+            if 2 < aspect_ratio < 6:
                 return img[y:y + h, x:x + w]
 
     return None
