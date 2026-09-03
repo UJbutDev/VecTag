@@ -1,17 +1,20 @@
 from ultralytics import YOLO
 import cv2
 import numpy as np
+import os
 
-# Use a pretrained YOLOv8 model for now; swap for a plate-specific
-# fine-tuned model later if you find/train one.
-_model = YOLO("yolov8n.pt")
+# Plate-specific YOLOv8 model (yasirfaizahmed/license-plate-object-detection,
+# fine-tuned on Keremberke's license-plate dataset). Falls back to OpenCV
+# contour detection if no plate is found.
+_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "plate_detector.pt")
+_model = YOLO(_MODEL_PATH)
 
 
 def detect_plate_region(image_path: str):
     """
     Returns the cropped plate region as a numpy array, or None if
     no plate-like region found.
-    Fallback: if YOLO doesn't find a plate class, use OpenCV contour
+    Fallback: if YOLO doesn't find a plate, use OpenCV contour
     detection as a naive rectangle finder.
     """
     img = cv2.imread(image_path)

@@ -8,3 +8,4 @@ rapidfuzz
 opencv-python
 python-dotenv
 numpy
+huggingface-hub
