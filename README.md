@@ -91,41 +91,6 @@ Everything in the stack is free / open-source — no paid APIs or licensed model
 
 ---
 
-## Data Model
-
-```mermaid
-erDiagram
-    cameras ||--o{ plate_detections : "detected at"
-    plates_reference ||--o{ plate_detections : "matched to"
-
-    cameras {
-        int id PK
-        text camera_name
-        float latitude
-        float longitude
-    }
-    plates_reference {
-        int id PK
-        text plate_number UK
-        text owner_name
-        text vehicle_type
-        text status "normal | stolen | blacklisted"
-    }
-    plate_detections {
-        int id PK
-        text raw_text
-        text cleaned_text
-        float confidence
-        int camera_id FK
-        int matched_plate_id FK
-        float match_score
-        text match_status "matched | no_match"
-        timestamp detected_at
-        text image_path
-    }
-
----
-
 ## Project Status
 
 Prototype under active development for SIH 2026.
