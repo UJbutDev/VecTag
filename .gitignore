@@ -6,3 +6,5 @@ venv/
 *.pt
 uploads/
 debug_output/
+test_images/*.png
+test_images/*.jpg

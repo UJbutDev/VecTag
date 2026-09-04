@@ -6,10 +6,9 @@ def preprocess_plate_variants(plate_img):
     """
     Returns a list of differently-processed candidate images for the same
     plate crop. Different real-world plates (dotted/embossed vs flat-printed,
-    uneven lighting vs clean/even lighting) respond better to different
-    threshold strategies — no single fixed method has worked well across
-    all real test cases so far. Caller should run OCR on each and keep
-    whichever gives the best result, rather than committing to one variant.
+    uneven lighting vs clean lighting) respond better to different
+    strategies — no single fixed method has worked well across all real
+    test cases so far.
     """
     gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
     scale = 4
@@ -20,8 +19,16 @@ def preprocess_plate_variants(plate_img):
 
     variants = []
 
+    # Variant D: minimally processed grayscale, NOT binarized. EasyOCR's
+    # text detector was trained on natural images with soft/anti-aliased
+    # edges — a hard black/white threshold can actually hurt detection on
+    # large, thick, blocky characters, even though the binarized image
+    # looks "cleaner" to a human eye. Try this first since it's the
+    # least likely to destroy detectable structure.
+    variants.append(enhanced)
+
     # Variant A: adaptive threshold + closing — tuned for embossed/dotted
-    # plates and uneven lighting (glare, shadow).
+    # plates and uneven lighting.
     adaptive = cv2.adaptiveThreshold(
         enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY, 15, 8
@@ -29,14 +36,11 @@ def preprocess_plate_variants(plate_img):
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     variants.append(cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel, iterations=1))
 
-    # Variant B: Otsu threshold, no morphology — tends to work better on
-    # clean, high-contrast, evenly-lit flat-printed plates, where adaptive
-    # threshold's local windowing can fragment otherwise-solid strokes.
+    # Variant B: Otsu threshold, no morphology.
     _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     variants.append(otsu)
 
-    # Variant C: larger-block adaptive threshold, no morphology — a
-    # gentler middle ground between A and B.
+    # Variant C: larger-block adaptive threshold, no morphology.
     adaptive_soft = cv2.adaptiveThreshold(
         enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY, 31, 10
@@ -47,9 +51,5 @@ def preprocess_plate_variants(plate_img):
 
 
 def preprocess_plate(plate_img):
-    """
-    Kept for backward compatibility — returns just the first (adaptive+
-    closing) variant. Prefer preprocess_plate_variants() + best-of-N OCR
-    in new code.
-    """
+    """Kept for backward compatibility — returns just the grayscale variant."""
     return preprocess_plate_variants(plate_img)[0]
