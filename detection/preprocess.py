@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 
+from detection.super_res import maybe_super_resolve
+
 
 def _deskew(gray_img):
     edges = cv2.Canny(gray_img, 50, 150)
@@ -55,7 +57,11 @@ def _adaptive_enhance(gray_img):
     return enhanced
 
 
-def preprocess_plate_variants(plate_img):
+def _variants_from_crop(plate_img):
+    """
+    The original variant-generation pipeline, unchanged, factored out
+    so it can run on either the raw crop or an SR'd copy of it.
+    """
     padded = cv2.copyMakeBorder(
         plate_img, top=10, bottom=10, left=15, right=15,
         borderType=cv2.BORDER_REPLICATE
@@ -122,6 +128,21 @@ def preprocess_plate_variants(plate_img):
     nudged = cv2.warpAffine(enhanced, M_pos, (w2, h2), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
     _, nudged_otsu = cv2.threshold(nudged, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     variants.append(nudged_otsu)
+
+    return variants
+
+
+def preprocess_plate_variants(plate_img):
+    variants = _variants_from_crop(plate_img)
+
+    # Extra candidates only for small/low-res crops (e.g. PB01N0050-style
+    # cases) — maybe_super_resolve() returns None instantly for crops
+    # that are already large enough, or if the SR model isn't installed,
+    # so this is a no-op for the common case and never blocks the
+    # existing pipeline.
+    sr_crop = maybe_super_resolve(plate_img)
+    if sr_crop is not None:
+        variants.extend(_variants_from_crop(sr_crop))
 
     return variants
 
