@@ -94,9 +94,3 @@ Everything in the stack is free / open-source — no paid APIs or licensed model
 ## Project Status
 
 Prototype under active development for SIH 2026.
-
----
-
-## Team
-
-A 2-person student team built this for SIH 2026, splitting detection/matching and trajectory/analytics as independent, API-contracted modules against a shared database.
