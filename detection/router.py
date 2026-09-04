@@ -7,9 +7,8 @@ from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 
 from detection.detect_plate import detect_plate_region
 from detection.preprocess import preprocess_plate_variants
-from detection.ocr import run_ocr_best_of
-from detection.clean_text import clean_text
-from detection.match import find_best_match
+from detection.ocr import run_ocr, synthesize_voted_candidate
+from detection.match import find_best_match_across_candidates
 from detection.db import get_all_reference_plates, camera_exists, insert_detection
 
 router = APIRouter()
@@ -19,8 +18,8 @@ DEBUG_DIR = "debug_output"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
-# Set False once you're done tuning — saves a crop + processed image(s) per scan
 SAVE_DEBUG_IMAGES = True
+DEBUG_LOG = True
 
 
 @router.post("/scan")
@@ -36,30 +35,45 @@ async def scan_plate(
     with open(temp_path, "wb") as f:
         shutil.copyfileobj(image.file, f)
 
-    plate_crop = detect_plate_region(temp_path)
-    if plate_crop is None:
+    # detect_plate_region now returns a LIST of candidate crops (usually
+    # 1, but 2 when YOLO's best box was low-confidence and the contour
+    # fallback was also tried). Cross-candidate OCR+DB-matching decides
+    # which crop, if either, actually produced a real plate reading.
+    plate_crops = detect_plate_region(temp_path)
+    if not plate_crops:
         return {"error": "no_plate_detected"}
 
-    if SAVE_DEBUG_IMAGES:
-        cv2.imwrite(os.path.join(DEBUG_DIR, f"crop_{image.filename}"), plate_crop)
+    ocr_candidates = []
+    for crop_i, plate_crop in enumerate(plate_crops):
+        if SAVE_DEBUG_IMAGES:
+            cv2.imwrite(os.path.join(DEBUG_DIR, f"crop_{crop_i}_{image.filename}"), plate_crop)
 
-    # Multiple threshold strategies tried per image, since no single fixed
-    # method has worked well across all real test cases (dotted/embossed
-    # plates vs clean flat-printed plates respond very differently).
-    variants = preprocess_plate_variants(plate_crop)
+        variants = preprocess_plate_variants(plate_crop)
 
-    if SAVE_DEBUG_IMAGES:
-        for i, v in enumerate(variants):
-            cv2.imwrite(os.path.join(DEBUG_DIR, f"processed_{i}_{image.filename}"), v)
+        if SAVE_DEBUG_IMAGES:
+            for i, v in enumerate(variants):
+                cv2.imwrite(os.path.join(DEBUG_DIR, f"processed_{crop_i}_{i}_{image.filename}"), v)
 
-    raw_text, confidence = run_ocr_best_of(variants)
-    if not raw_text:
-        return {"error": "no_plate_detected"}
+        ocr_candidates.extend(run_ocr(v) for v in variants)
 
-    cleaned, is_valid = clean_text(raw_text)
+    voted_text, voted_conf = synthesize_voted_candidate(ocr_candidates)
+    if voted_text:
+        ocr_candidates.append((voted_text, voted_conf))
 
     reference_plates = get_all_reference_plates()
-    matched_plate, match_score, match_status = find_best_match(cleaned, reference_plates)
+
+    raw_text, cleaned, confidence, matched_plate, match_score, match_status = \
+        find_best_match_across_candidates(ocr_candidates, reference_plates)
+
+    if DEBUG_LOG:
+        for i, (text, conf) in enumerate(ocr_candidates):
+            label = "voted" if voted_text and i == len(ocr_candidates) - 1 else f"candidate_{i}"
+            print(f"[router debug] {label}: raw={text!r} conf={conf}")
+        print(f"[router debug] CHOSEN: raw={raw_text!r} cleaned={cleaned!r} "
+              f"score={match_score} status={match_status}")
+
+    if not raw_text:
+        return {"error": "no_plate_detected"}
 
     row = {
         "raw_text": raw_text,

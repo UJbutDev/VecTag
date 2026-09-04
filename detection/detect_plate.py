@@ -3,58 +3,88 @@ import cv2
 import numpy as np
 import os
 
-# Plate-specific YOLOv8 model (yasirfaizahmed/license-plate-object-detection,
-# fine-tuned on Keremberke's license-plate dataset). Falls back to OpenCV
-# contour detection if no plate is found.
 _MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "plate_detector.pt")
 _model = YOLO(_MODEL_PATH)
 
-# Shrinks the detected box inward by this fraction on each side before
-# cropping. YOLO boxes tend to land right at (or slightly past) the plate
-# edge, catching the frame/holder/screws.
-_MARGIN_TRIM = 0.05  # 5% inward on each side
+_MARGIN_TRIM = 0.02
+_PAD_PX = 8
 
-# Many HSRP plates have a blue IND chip/hologram badge on the far left,
-# which is not part of the plate number. DISABLED for now — needs
-# validation across more real samples before trusting it unconditionally.
 _STRIP_IND_CHIP = False
 _IND_CHIP_WIDTH_FRACTION = 0.10
 
-# TEMP DIAGNOSTIC: lowered from the ultralytics default (0.25) to check
-# whether low-confidence plate boxes are being found and silently
-# discarded on hard cases (small/angled plates, glare, etc.), vs the
-# model genuinely finding nothing at all. Remove/restore once diagnosed.
+# TODO: revisit once detection quality is stable — 0.05 risks accepting
+# bad/spurious boxes on other images. Not yet re-tuned.
 _DEBUG_CONF = 0.05
+
+_LOW_CONF_WARN_THRESHOLD = 0.3
 
 
 def detect_plate_region(image_path: str):
     """
-    Returns the cropped plate region as a numpy array, or None if
-    no plate-like region found.
-    Fallback: if YOLO doesn't find a plate, use OpenCV contour
-    detection as a naive rectangle finder.
+    Returns a LIST of candidate cropped plate regions (usually 1, but 2
+    when YOLO's best box is low-confidence). Confirmed need on
+    PB01N0050 (box conf 0.129) — a weak YOLO box was being trusted
+    outright even though it was clearly unreliable, and no downstream
+    fix (preprocessing, voting, text-cleaning) can recover a plate from
+    a crop that doesn't actually contain the full plate. Rather than
+    guessing a new confidence cutoff (which risks breaking other
+    working cases), a low-confidence YOLO box now gets a second,
+    independent crop attempt via the contour fallback, and BOTH crops
+    are handed downstream — cross-candidate OCR+DB-matching (already
+    built) decides which one, if either, actually reads as a real
+    plate. This is the same "let the database arbitrate" principle
+    already used for OCR-variant and cleaning-interpretation selection,
+    just applied one stage earlier.
+
+    Returns [] if nothing usable was found at all.
     """
     img = cv2.imread(image_path)
     if img is None:
-        return None
+        return []
 
     results = _model(img, verbose=False, conf=_DEBUG_CONF)
     boxes = results[0].boxes
+
+    crops = []
 
     if boxes is not None and len(boxes) > 0:
         for b in boxes:
             print(f"[debug] plate box conf={float(b.conf[0]):.3f}")
 
         best = boxes[boxes.conf.argmax()]
+        best_conf = float(best.conf[0])
+
         x1, y1, x2, y2 = map(int, best.xyxy[0])
         x1, y1, x2, y2 = _trim_margin(x1, y1, x2, y2, img.shape)
-        cropped = img[y1:y2, x1:x2]
+        yolo_crop = img[y1:y2, x1:x2]
+
         if _STRIP_IND_CHIP:
-            cropped = _strip_ind_chip(cropped)
-        return cropped
+            yolo_crop = _strip_ind_chip(yolo_crop)
+
+        yolo_crop = _pad(yolo_crop)
+        if yolo_crop is not None and yolo_crop.size > 0:
+            crops.append(yolo_crop)
+
+        if best_conf < _LOW_CONF_WARN_THRESHOLD:
+            print(f"[detect_plate] WARNING: low-confidence detection "
+                  f"({best_conf:.3f} < {_LOW_CONF_WARN_THRESHOLD}) on {os.path.basename(image_path)} "
+                  f"— also trying contour fallback as a second candidate crop.")
+            fallback_crop = _contour_fallback(img)
+            if fallback_crop is not None:
+                fallback_crop = _pad(fallback_crop)
+                if fallback_crop is not None and fallback_crop.size > 0:
+                    crops.append(fallback_crop)
+
+        return crops
 
     print(f"[debug] literally zero boxes even at conf={_DEBUG_CONF}")
-    return _contour_fallback(img)
+    fallback_crop = _contour_fallback(img)
+    if fallback_crop is not None:
+        fallback_crop = _pad(fallback_crop)
+        if fallback_crop is not None and fallback_crop.size > 0:
+            crops.append(fallback_crop)
+
+    return crops
 
 
 def _trim_margin(x1, y1, x2, y2, img_shape):
@@ -71,6 +101,15 @@ def _trim_margin(x1, y1, x2, y2, img_shape):
     y2 = min(h_img, y2 - dy)
 
     return x1, y1, x2, y2
+
+
+def _pad(cropped):
+    if cropped is None or cropped.size == 0:
+        return cropped
+    return cv2.copyMakeBorder(
+        cropped, _PAD_PX, _PAD_PX, _PAD_PX, _PAD_PX,
+        cv2.BORDER_CONSTANT, value=(255, 255, 255)
+    )
 
 
 def _strip_ind_chip(cropped):

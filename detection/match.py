@@ -1,35 +1,21 @@
 from rapidfuzz import process, fuzz
 from rapidfuzz.distance import Levenshtein
 
-MATCH_THRESHOLD = 85.0  # tunable, applies to 'normal' status plates
+from detection.clean_text import clean_text_candidates
 
-# Indian plates are a fixed-format 9-10 chars. A missing/extra character
-# from OCR is a structural red flag, not just noise — a plain similarity
-# ratio can score deceptively high even when characters are dropped
-# (e.g. "M43CC174" vs "MH43CC1745" scored 88.89 despite missing 2 chars).
+MATCH_THRESHOLD = 85.0
 MAX_LENGTH_DIFF = 1
-MAX_EDIT_DISTANCE = 2  # hard cap, regardless of what the ratio score says
-
-# Higher bar before flagging a plate as stolen/blacklisted — a false
-# "no_match" just costs a missed log entry; a false "matched" here has
-# real consequences, so it needs stronger evidence.
+MAX_EDIT_DISTANCE = 2
 STRICT_STATUS = {"stolen", "blacklisted"}
 STRICT_THRESHOLD = 92.0
 
 
 def find_best_match(cleaned_text: str, reference_plates: list):
-    """
-    reference_plates: list of dicts from plates_reference table.
-    Returns (matched_plate_dict_or_None, score, match_status).
-    """
     if not cleaned_text or not reference_plates:
         return None, 0.0, "no_match"
 
     plate_numbers = [p["plate_number"] for p in reference_plates]
-
-    result = process.extractOne(
-        cleaned_text, plate_numbers, scorer=fuzz.ratio
-    )
+    result = process.extractOne(cleaned_text, plate_numbers, scorer=fuzz.ratio)
 
     if result is None:
         return None, 0.0, "no_match"
@@ -37,8 +23,6 @@ def find_best_match(cleaned_text: str, reference_plates: list):
     matched_text, score, idx = result
     candidate = reference_plates[idx]
 
-    # Structural guard: reject if characters were dropped/added, even if
-    # the ratio score looks high. Catches exactly the failure mode above.
     length_diff = abs(len(cleaned_text) - len(matched_text))
     edit_distance = Levenshtein.distance(cleaned_text, matched_text)
 
@@ -51,3 +35,32 @@ def find_best_match(cleaned_text: str, reference_plates: list):
         return candidate, score, "matched"
 
     return None, score, "no_match"
+
+
+def find_best_match_across_candidates(ocr_candidates: list, reference_plates: list):
+    best_matched = None
+    best_fallback = None
+
+    for raw_text, conf in ocr_candidates:
+        if not raw_text:
+            continue
+
+        cleaned_options = clean_text_candidates(raw_text)
+        if not cleaned_options:
+            import re
+            cleaned_options = [re.sub(r'[^A-Z0-9]', '', raw_text.upper())]
+
+        for cleaned in cleaned_options:
+            matched_plate, score, status = find_best_match(cleaned, reference_plates)
+            result = (raw_text, cleaned, conf, matched_plate, score, status)
+
+            if status == "matched" and (best_matched is None or score > best_matched[4]):
+                best_matched = result
+            if best_fallback is None or score > best_fallback[4]:
+                best_fallback = result
+
+    if best_matched:
+        return best_matched
+    if best_fallback:
+        return best_fallback
+    return "", "", 0.0, None, 0.0, "no_match"
