@@ -6,8 +6,8 @@ from datetime import datetime
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 
 from detection.detect_plate import detect_plate_region
-from detection.preprocess import preprocess_plate
-from detection.ocr import run_ocr
+from detection.preprocess import preprocess_plate_variants
+from detection.ocr import run_ocr_best_of
 from detection.clean_text import clean_text
 from detection.match import find_best_match
 from detection.db import get_all_reference_plates, camera_exists, insert_detection
@@ -19,7 +19,7 @@ DEBUG_DIR = "debug_output"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
-# Set False once you're done tuning — saves a crop + processed image per scan
+# Set False once you're done tuning — saves a crop + processed image(s) per scan
 SAVE_DEBUG_IMAGES = True
 
 
@@ -43,12 +43,16 @@ async def scan_plate(
     if SAVE_DEBUG_IMAGES:
         cv2.imwrite(os.path.join(DEBUG_DIR, f"crop_{image.filename}"), plate_crop)
 
-    processed = preprocess_plate(plate_crop)
+    # Multiple threshold strategies tried per image, since no single fixed
+    # method has worked well across all real test cases (dotted/embossed
+    # plates vs clean flat-printed plates respond very differently).
+    variants = preprocess_plate_variants(plate_crop)
 
     if SAVE_DEBUG_IMAGES:
-        cv2.imwrite(os.path.join(DEBUG_DIR, f"processed_{image.filename}"), processed)
+        for i, v in enumerate(variants):
+            cv2.imwrite(os.path.join(DEBUG_DIR, f"processed_{i}_{image.filename}"), v)
 
-    raw_text, confidence = run_ocr(processed)
+    raw_text, confidence = run_ocr_best_of(variants)
     if not raw_text:
         return {"error": "no_plate_detected"}
 

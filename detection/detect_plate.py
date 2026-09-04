@@ -11,9 +11,20 @@ _model = YOLO(_MODEL_PATH)
 
 # Shrinks the detected box inward by this fraction on each side before
 # cropping. YOLO boxes tend to land right at (or slightly past) the plate
-# edge, catching the frame/holder/screws. Trimming a small margin removes
-# that border noise without cutting into real characters.
+# edge, catching the frame/holder/screws.
 _MARGIN_TRIM = 0.05  # 5% inward on each side
+
+# Many HSRP plates have a blue IND chip/hologram badge on the far left,
+# which is not part of the plate number. DISABLED for now — needs
+# validation across more real samples before trusting it unconditionally.
+_STRIP_IND_CHIP = False
+_IND_CHIP_WIDTH_FRACTION = 0.10
+
+# TEMP DIAGNOSTIC: lowered from the ultralytics default (0.25) to check
+# whether low-confidence plate boxes are being found and silently
+# discarded on hard cases (small/angled plates, glare, etc.), vs the
+# model genuinely finding nothing at all. Remove/restore once diagnosed.
+_DEBUG_CONF = 0.05
 
 
 def detect_plate_region(image_path: str):
@@ -27,15 +38,22 @@ def detect_plate_region(image_path: str):
     if img is None:
         return None
 
-    results = _model(img, verbose=False)
+    results = _model(img, verbose=False, conf=_DEBUG_CONF)
     boxes = results[0].boxes
 
     if boxes is not None and len(boxes) > 0:
+        for b in boxes:
+            print(f"[debug] plate box conf={float(b.conf[0]):.3f}")
+
         best = boxes[boxes.conf.argmax()]
         x1, y1, x2, y2 = map(int, best.xyxy[0])
         x1, y1, x2, y2 = _trim_margin(x1, y1, x2, y2, img.shape)
-        return img[y1:y2, x1:x2]
+        cropped = img[y1:y2, x1:x2]
+        if _STRIP_IND_CHIP:
+            cropped = _strip_ind_chip(cropped)
+        return cropped
 
+    print(f"[debug] literally zero boxes even at conf={_DEBUG_CONF}")
     return _contour_fallback(img)
 
 
@@ -53,6 +71,12 @@ def _trim_margin(x1, y1, x2, y2, img_shape):
     y2 = min(h_img, y2 - dy)
 
     return x1, y1, x2, y2
+
+
+def _strip_ind_chip(cropped):
+    h, w = cropped.shape[:2]
+    chip_width = int(w * _IND_CHIP_WIDTH_FRACTION)
+    return cropped[:, chip_width:]
 
 
 def _contour_fallback(img):
