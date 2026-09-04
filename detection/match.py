@@ -10,48 +10,31 @@ from detection.clean_text import clean_text_candidates
 # CONFIGURATION
 # ============================================================
 
-# Maximum character edits we are willing to consider.
 MAX_EDIT_DISTANCE = 2
 
-# Minimum general fuzzy similarity for a candidate to even be
-# considered plausible.
-MIN_SIMILARITY = 80.0
-
-# Candidate must have the same number of characters as the DB
-# plate for an actual match.
+# Minimum similarity before a DB record is considered
+# remotely plausible.
 #
-# This is intentionally strict. A missing/extra character can
-# completely change a registration number.
-REQUIRE_SAME_LENGTH = True
+# This is NOT the final acceptance threshold.
+MIN_SIMILARITY = 70.0
 
-# Statuses that deserve stricter acceptance rules.
+# These statuses are handled with the same strong structural
+# matching rules. We do not lower the matching requirements
+# just because a vehicle is normal/stolen/blacklisted.
 STRICT_STATUS = {
     "stolen",
     "blacklisted",
 }
 
-# Minimum ranking margin between the best and second-best DB
-# plate when the match is not exact.
-MIN_MATCH_MARGIN = 2.0
+# When two different DB records are nearly equally plausible,
+# avoid guessing.
+MIN_MATCH_MARGIN = 3.0
 
 
 # ============================================================
 # OCR CHARACTER CONFUSIONS
 # ============================================================
 
-# These are common OCR confusions between letters and digits.
-#
-# We use them ONLY when comparing OCR output against a
-# database plate. We do NOT globally replace characters here.
-#
-# Example:
-#
-#     O ↔ 0
-#     I ↔ 1
-#     B ↔ 8
-#
-# This preserves the original OCR text while allowing the
-# matcher to recognize plausible OCR mistakes.
 OCR_CONFUSION_PAIRS = {
     frozenset(("0", "O")),
     frozenset(("0", "D")),
@@ -63,11 +46,17 @@ OCR_CONFUSION_PAIRS = {
     frozenset(("1", "Y")),
 
     frozenset(("2", "Z")),
+
     frozenset(("3", "E")),
+
     frozenset(("4", "A")),
+
     frozenset(("5", "S")),
+
     frozenset(("6", "G")),
+
     frozenset(("7", "T")),
+
     frozenset(("8", "B")),
 }
 
@@ -78,9 +67,7 @@ OCR_CONFUSION_PAIRS = {
 
 def _normalize_plate(text):
     """
-    Normalize a plate for comparison.
-
-    Keeps only A-Z and 0-9.
+    Keep only A-Z and 0-9.
     """
 
     if not text:
@@ -95,7 +82,8 @@ def _normalize_plate(text):
 
 def _is_confusion_pair(a, b):
     """
-    Return True if a and b are a known OCR confusion pair.
+    Check whether two different characters are a known
+    OCR confusion pair.
     """
 
     if a == b:
@@ -107,21 +95,279 @@ def _is_confusion_pair(a, b):
 
 
 # ============================================================
-# CHARACTER / POSITION ANALYSIS
+# DATABASE PLATE STRUCTURE
 # ============================================================
 
-def _compare_characters(ocr_text, db_text):
+def _possible_layouts(plate):
     """
-    Compare two same-length strings character by character.
+    Generate possible structures for a database plate.
 
-    Returns detailed structural information.
+    Example:
+
+        MH01EE2388
+
+    becomes:
+
+        state  = MH
+        rto    = 01
+        series = EE
+        number = 2388
+
+    We allow:
+        RTO = 1 or 2 digits
+        Series = 1 to 3 characters
+
+    This function is primarily used for trusted DB plates.
     """
 
-    length = len(db_text)
+    plate = _normalize_plate(
+        plate
+    )
+
+    if len(plate) < 8:
+        return []
+
+    state = plate[:2]
+    number = plate[-4:]
+    middle = plate[2:-4]
+
+    if not state.isalpha():
+        return []
+
+    if not number.isdigit():
+        return []
+
+    layouts = []
+
+    for rto_len in (1, 2):
+
+        if len(middle) <= rto_len:
+            continue
+
+        rto = middle[:rto_len]
+        series = middle[rto_len:]
+
+        if not rto.isdigit():
+            continue
+
+        if not series.isalpha():
+            continue
+
+        if not 1 <= len(series) <= 3:
+            continue
+
+        layouts.append(
+            {
+                "state": state,
+                "rto": rto,
+                "series": series,
+                "number": number,
+            }
+        )
+
+    return layouts
+
+
+def _best_layout_pair(
+        ocr_text,
+        db_text
+):
+    """
+    Use the DB plate's trusted structure as the reference.
+
+    IMPORTANT:
+
+    The OCR string is NOT required to obey the expected
+    letter/digit types.
+
+    This is intentional.
+
+    Example:
+
+        DB:
+        DL8CBG2956
+
+        DB layout:
+        DL | 8 | CBG | 2956
+
+        OCR:
+        QL8C9G2956
+
+        OCR interpreted using DB layout:
+        QL | 8 | C9G | 2956
+
+    This lets us reason about OCR errors without throwing
+    the candidate away just because OCR put a digit where
+    a letter should be.
+    """
+
+    ocr_text = _normalize_plate(
+        ocr_text
+    )
+
+    db_text = _normalize_plate(
+        db_text
+    )
+
+    if not ocr_text or not db_text:
+        return None
+
+    if len(ocr_text) != len(db_text):
+        return None
+
+    db_layouts = _possible_layouts(
+        db_text
+    )
+
+    if not db_layouts:
+        return None
+
+    best = None
+
+    for db in db_layouts:
+
+        state_len = len(
+            db["state"]
+        )
+
+        rto_len = len(
+            db["rto"]
+        )
+
+        series_len = len(
+            db["series"]
+        )
+
+        number_len = len(
+            db["number"]
+        )
+
+        expected_length = (
+                state_len
+                + rto_len
+                + series_len
+                + number_len
+        )
+
+        if expected_length != len(
+                db_text
+        ):
+            continue
+
+        # ----------------------------------------------------
+        # Split OCR using the DB's known structure.
+        #
+        # No letter/digit validation is performed here.
+        # ----------------------------------------------------
+
+        position = 0
+
+        ocr_state = ocr_text[
+            position:
+            position + state_len
+        ]
+
+        position += state_len
+
+        ocr_rto = ocr_text[
+            position:
+            position + rto_len
+        ]
+
+        position += rto_len
+
+        ocr_series = ocr_text[
+            position:
+            position + series_len
+        ]
+
+        position += series_len
+
+        ocr_number = ocr_text[
+            position:
+            position + number_len
+        ]
+
+        # ----------------------------------------------------
+        # Compare each section.
+        # ----------------------------------------------------
+
+        state_score = fuzz.ratio(
+            ocr_state,
+            db["state"]
+        )
+
+        rto_score = fuzz.ratio(
+            ocr_rto,
+            db["rto"]
+        )
+
+        series_score = fuzz.ratio(
+            ocr_series,
+            db["series"]
+        )
+
+        number_score = fuzz.ratio(
+            ocr_number,
+            db["number"]
+        )
+
+        # State and final registration number carry the
+        # largest weight.
+        structural_score = (
+                state_score * 0.30
+                + rto_score * 0.15
+                + series_score * 0.15
+                + number_score * 0.40
+        )
+
+        ocr_layout = {
+            "state": ocr_state,
+            "rto": ocr_rto,
+            "series": ocr_series,
+            "number": ocr_number,
+        }
+
+        candidate = (
+            structural_score,
+            ocr_layout,
+            db,
+            state_score,
+            rto_score,
+            series_score,
+            number_score,
+        )
+
+        if (
+                best is None
+                or structural_score > best[0]
+        ):
+            best = candidate
+
+    return best
+
+
+# ============================================================
+# CHARACTER-BY-CHARACTER COMPARISON
+# ============================================================
+
+def _compare_characters(
+        ocr_text,
+        db_text
+):
+    """
+    Compare two same-length strings character-by-character.
+    """
+
+    length = min(
+        len(ocr_text),
+        len(db_text)
+    )
 
     exact_positions = 0
     confusion_positions = 0
-    mismatched_positions = []
+
+    mismatches = []
 
     for i in range(length):
 
@@ -140,7 +386,7 @@ def _compare_characters(ocr_text, db_text):
             ):
                 confusion_positions += 1
 
-            mismatched_positions.append(
+            mismatches.append(
                 (
                     i,
                     ocr_char,
@@ -149,9 +395,7 @@ def _compare_characters(ocr_text, db_text):
             )
 
     # --------------------------------------------------------
-    # Prefix agreement
-    #
-    # First two characters are normally the state code.
+    # State prefix
     # --------------------------------------------------------
 
     prefix_length = min(
@@ -161,15 +405,14 @@ def _compare_characters(ocr_text, db_text):
 
     prefix_matches = sum(
         1
-        for i in range(prefix_length)
+        for i in range(
+            prefix_length
+        )
         if ocr_text[i] == db_text[i]
     )
 
     # --------------------------------------------------------
-    # Suffix agreement
-    #
-    # Last four characters are an extremely useful anchor
-    # because they normally represent the registration number.
+    # Final four registration digits
     # --------------------------------------------------------
 
     suffix_start = max(
@@ -187,44 +430,47 @@ def _compare_characters(ocr_text, db_text):
     )
 
     return {
-        "exact_positions": exact_positions,
-        "confusion_positions": confusion_positions,
-        "mismatched_positions": mismatched_positions,
-        "prefix_matches": prefix_matches,
-        "suffix_matches": suffix_matches,
+        "exact_positions":
+            exact_positions,
+
+        "confusion_positions":
+            confusion_positions,
+
+        "mismatches":
+            mismatches,
+
+        "prefix_matches":
+            prefix_matches,
+
+        "suffix_matches":
+            suffix_matches,
     }
 
 
 # ============================================================
-# MATCH QUALITY
+# COMBINED QUALITY SCORE
 # ============================================================
 
-def _match_quality(
+def _quality_score(
         ocr_text,
         db_text,
-        comparison
+        comparison,
+        structural
 ):
     """
-    Calculate an evidence-based quality score.
+    Database-oriented score.
 
-    This is NOT the same as RapidFuzz score.
-
-    It combines:
-
-        - overall string similarity
-        - exact character positions
-        - state prefix agreement
-        - final registration number agreement
+    This deliberately isn't just RapidFuzz.
     """
-
-    length = len(db_text)
-
-    if length == 0:
-        return 0.0
 
     fuzzy_score = fuzz.ratio(
         ocr_text,
         db_text
+    )
+
+    length = max(
+        len(db_text),
+        1
     )
 
     position_score = (
@@ -242,46 +488,62 @@ def _match_quality(
                            / min(4, length)
                    ) * 100.0
 
-    # Weighted toward actual positional agreement.
-    quality = (
-            fuzzy_score * 0.40 +
-            position_score * 0.30 +
-            prefix_score * 0.15 +
-            suffix_score * 0.15
+    structural_score = (
+        structural[0]
+        if structural is not None
+        else 0.0
     )
 
-    return quality
+    return (
+            fuzzy_score * 0.25
+            + position_score * 0.25
+            + prefix_score * 0.15
+            + suffix_score * 0.20
+            + structural_score * 0.15
+    )
 
 
 # ============================================================
-# ACCEPTANCE RULES
+# STRONG MATCH LOGIC
 # ============================================================
 
-def _strong_match_rules(
+def _strong_match(
         ocr_text,
         db_text,
-        comparison
+        comparison,
+        structural
 ):
     """
-    Decide whether this OCR string is structurally strong
-    enough to identify the database plate.
+    Determine whether an OCR candidate has enough evidence
+    to identify this specific DB plate.
 
-    The goal is to avoid "85% fuzzy = match".
+    This intentionally does NOT mean:
 
-    A strong match should have meaningful positional evidence.
+        fuzzy score > X = match
+
+    Instead it looks at:
+        - edit distance
+        - exact character positions
+        - state code
+        - RTO
+        - series
+        - final four digits
+        - OCR confusion pairs
+        - DB structure
     """
 
-    length = len(db_text)
-
-    if length < 8:
+    if not ocr_text or not db_text:
         return False
 
-    edit_distance = Levenshtein.distance(
+    if len(ocr_text) != len(db_text):
+        return False
+
+    distance = Levenshtein.distance(
         ocr_text,
         db_text
     )
 
-    if edit_distance > MAX_EDIT_DISTANCE:
+    if distance > MAX_EDIT_DISTANCE:
         return False
 
     exact_positions = comparison[
@@ -300,42 +562,29 @@ def _strong_match_rules(
         "suffix_matches"
     ]
 
-    mismatched_positions = comparison[
-        "mismatched_positions"
-    ]
+    # ========================================================
+    # EXACT MATCH
+    # ========================================================
 
-    # --------------------------------------------------------
-    # RULE 1: EXACT MATCH
-    # --------------------------------------------------------
-
-    if ocr_text == db_text:
+    if distance == 0:
         return True
 
-    # --------------------------------------------------------
-    # RULE 2: ONE-CHARACTER ERROR WITH STRONG ANCHORS
-    #
-    # Example:
-    #
-    # DL7CO1939
-    # DL7CQ1939
-    #
-    # or:
-    #
-    # WB22U4I16
-    # WB22U4116
-    # --------------------------------------------------------
+    # ========================================================
+    # ONE CHARACTER ERROR
+    # ========================================================
 
-    if edit_distance == 1:
+    if distance == 1:
 
-        # State + registration number strongly agree.
+        # State is correct and most of the registration number
+        # is also correct.
         if (
                 prefix_matches == 2
                 and suffix_matches >= 3
         ):
             return True
 
-        # Registration number is completely correct and only
-        # one of the first/state characters is wrong.
+        # Final four digits are exact and the state still has
+        # at least one matching character.
         #
         # Example:
         #
@@ -343,12 +592,11 @@ def _strong_match_rules(
         # MH01EE2388
         if (
                 suffix_matches == 4
-                and exact_positions >= length - 1
                 and prefix_matches >= 1
         ):
             return True
 
-        # One OCR confusion with a strong DB anchor.
+        # Known OCR confusion + strong anchor.
         if (
                 confusion_positions == 1
                 and (
@@ -358,19 +606,15 @@ def _strong_match_rules(
         ):
             return True
 
-    # --------------------------------------------------------
-    # RULE 3: TWO OCR ERRORS
-    #
-    # We allow two errors only when they are both plausible
-    # OCR confusions and the plate still has strong anchors.
-    #
-    # Example:
-    #
-    # WB22U4I1B
-    # WB22U4118
-    # --------------------------------------------------------
+    # ========================================================
+    # TWO CHARACTER ERRORS
+    # ========================================================
 
-    if edit_distance == 2:
+    if distance == 2:
+
+        # ----------------------------------------------------
+        # Two known OCR confusions + strong anchors.
+        # ----------------------------------------------------
 
         if (
                 confusion_positions == 2
@@ -379,24 +623,96 @@ def _strong_match_rules(
         ):
             return True
 
-        # One state-code error + one OCR confusion can still be
-        # strong if the rest of the plate agrees exactly.
+        # ----------------------------------------------------
+        # Very strong positional agreement.
+        # ----------------------------------------------------
+
         if (
-                suffix_matches == 4
-                and exact_positions >= length - 2
-                and confusion_positions >= 1
+                prefix_matches == 2
+                and suffix_matches >= 3
+                and exact_positions >= len(db_text) - 2
         ):
             return True
 
-    # --------------------------------------------------------
-    # Otherwise reject.
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # Strong DB structure:
+        #
+        # exact RTO
+        # exact final four digits
+        # only two total errors
+        #
+        # Example:
+        #
+        # QL8C9G2956
+        # DL8CBG2956
+        # ----------------------------------------------------
+
+        if structural is not None:
+
+            (
+                structural_score,
+                ocr_layout,
+                db_layout,
+                state_score,
+                rto_score,
+                series_score,
+                number_score,
+            ) = structural
+
+            exact_rto = (
+                    ocr_layout["rto"]
+                    == db_layout["rto"]
+            )
+
+            exact_number = (
+                    ocr_layout["number"]
+                    == db_layout["number"]
+            )
+
+            if (
+                    exact_rto
+                    and exact_number
+                    and exact_positions
+                    >= len(db_text) - 2
+            ):
+                return True
+
+        # ----------------------------------------------------
+        # Strong structure even where the character substitutions
+        # aren't explicitly known OCR confusions.
+        #
+        # Example:
+        #
+        # JK0EH0082
+        # JK08H0088
+        # ----------------------------------------------------
+
+        if structural is not None:
+
+            (
+                structural_score,
+                _,
+                _,
+                state_score,
+                rto_score,
+                series_score,
+                number_score,
+            ) = structural
+
+            if (
+                    state_score >= 99.0
+                    and number_score >= 75.0
+                    and structural_score >= 78.0
+                    and exact_positions
+                    >= len(db_text) - 2
+            ):
+                return True
 
     return False
 
 
 # ============================================================
-# ONE OCR STRING AGAINST THE WHOLE DATABASE
+# EVALUATE ONE OCR RESULT AGAINST ONE DB RECORD
 # ============================================================
 
 def _evaluate_reference(
@@ -404,9 +720,8 @@ def _evaluate_reference(
         reference_plate
 ):
     """
-    Evaluate one cleaned OCR string against one DB plate.
-
-    Returns detailed information.
+    Produce all matching evidence for one OCR result
+    versus one database plate.
     """
 
     ocr_text = _normalize_plate(
@@ -423,19 +738,17 @@ def _evaluate_reference(
     if not ocr_text or not db_text:
         return None
 
-    # Don't try to compare a completely different length.
-    if (
-            REQUIRE_SAME_LENGTH
-            and len(ocr_text) != len(db_text)
-    ):
+    # Do not silently add/remove characters when comparing
+    # registration numbers.
+    if len(ocr_text) != len(db_text):
         return None
 
-    edit_distance = Levenshtein.distance(
+    distance = Levenshtein.distance(
         ocr_text,
         db_text
     )
 
-    if edit_distance > MAX_EDIT_DISTANCE:
+    if distance > MAX_EDIT_DISTANCE:
         return None
 
     fuzzy_score = fuzz.ratio(
@@ -451,52 +764,83 @@ def _evaluate_reference(
         db_text
     )
 
-    quality = _match_quality(
+    structural = _best_layout_pair(
         ocr_text,
-        db_text,
-        comparison
+        db_text
     )
 
-    strong_match = _strong_match_rules(
+    quality = _quality_score(
         ocr_text,
         db_text,
-        comparison
+        comparison,
+        structural
+    )
+
+    strong = _strong_match(
+        ocr_text,
+        db_text,
+        comparison,
+        structural
     )
 
     return {
-        "reference": reference_plate,
-        "ocr_text": ocr_text,
-        "db_text": db_text,
-        "fuzzy_score": float(
-            fuzzy_score
-        ),
-        "quality": float(
-            quality
-        ),
-        "edit_distance": int(
-            edit_distance
-        ),
-        "exact_positions": comparison[
-            "exact_positions"
-        ],
-        "confusion_positions": comparison[
-            "confusion_positions"
-        ],
-        "prefix_matches": comparison[
-            "prefix_matches"
-        ],
-        "suffix_matches": comparison[
-            "suffix_matches"
-        ],
-        "mismatched_positions": comparison[
-            "mismatched_positions"
-        ],
-        "strong_match": strong_match,
+        "reference":
+            reference_plate,
+
+        "ocr_text":
+            ocr_text,
+
+        "db_text":
+            db_text,
+
+        "distance":
+            distance,
+
+        "fuzzy_score":
+            float(fuzzy_score),
+
+        "quality":
+            float(quality),
+
+        "strong_match":
+            strong,
+
+        "exact_positions":
+            comparison[
+                "exact_positions"
+            ],
+
+        "confusion_positions":
+            comparison[
+                "confusion_positions"
+            ],
+
+        "prefix_matches":
+            comparison[
+                "prefix_matches"
+            ],
+
+        "suffix_matches":
+            comparison[
+                "suffix_matches"
+            ],
+
+        "structural_score":
+            (
+                structural[0]
+                if structural is not None
+                else 0.0
+            ),
+
+        "mismatches":
+            comparison[
+                "mismatches"
+            ],
     }
 
 
 # ============================================================
-# BEST MATCH FOR ONE CLEANED STRING
+# SINGLE OCR STRING → DATABASE
 # ============================================================
 
 def find_best_match(
@@ -504,21 +848,26 @@ def find_best_match(
         reference_plates: list
 ):
     """
-    Match one cleaned OCR candidate against the complete DB.
-
-    Unlike the previous implementation, this does NOT use
-    RapidFuzz extractOne() to select one candidate and then
-    stop.
-
-    Every plausible reference plate is evaluated.
+    Compare a single cleaned OCR result against the entire DB.
     """
 
     cleaned_text = _normalize_plate(
         cleaned_text
     )
 
-    if not cleaned_text or not reference_plates:
-        return None, 0.0, "no_match"
+    if not cleaned_text:
+        return (
+            None,
+            0.0,
+            "no_match"
+        )
+
+    if not reference_plates:
+        return (
+            None,
+            0.0,
+            "no_match"
+        )
 
     evaluations = []
 
@@ -535,11 +884,11 @@ def find_best_match(
             )
 
     if not evaluations:
-        return None, 0.0, "no_match"
-
-    # --------------------------------------------------------
-    # First prefer actual strong matches.
-    # --------------------------------------------------------
+        return (
+            None,
+            0.0,
+            "no_match"
+        )
 
     strong_matches = [
         item
@@ -547,126 +896,206 @@ def find_best_match(
         if item["strong_match"]
     ]
 
-    if strong_matches:
+    # --------------------------------------------------------
+    # Nothing strong enough.
+    # --------------------------------------------------------
 
-        strong_matches.sort(
+    if not strong_matches:
+
+        evaluations.sort(
             key=lambda item: (
                 item["quality"],
                 item["fuzzy_score"],
-                -item["edit_distance"],
-                item["suffix_matches"],
-                item["prefix_matches"],
+                -item["distance"],
             ),
             reverse=True
         )
 
-        best = strong_matches[0]
-
-        # ----------------------------------------------------
-        # Check if there is another DB plate almost as strong.
-        #
-        # This protects against ambiguous registrations.
-        # ----------------------------------------------------
-
-        if len(strong_matches) > 1:
-
-            second = strong_matches[1]
-
-            margin = (
-                    best["quality"]
-                    - second["quality"]
-            )
-
-            if (
-                    margin < MIN_MATCH_MARGIN
-                    and best["fuzzy_score"] < 100.0
-            ):
-                return (
-                    None,
-                    best["fuzzy_score"],
-                    "ambiguous"
-                )
-
-        candidate = best["reference"]
-
-        # ----------------------------------------------------
-        # Strict-status handling
-        #
-        # We do NOT reduce strict status thresholds.
-        #
-        # Instead, a stolen/blacklisted vehicle must satisfy
-        # one of the explicit strong structural rules above.
-        # ----------------------------------------------------
-
-        status = str(
-            candidate.get(
-                "status",
-                ""
-            )
-        ).lower()
-
-        if status in STRICT_STATUS:
-
-            if not best["strong_match"]:
-                return (
-                    None,
-                    best["fuzzy_score"],
-                    "no_match"
-                )
-
         return (
-            candidate,
-            best["fuzzy_score"],
-            "matched"
+            None,
+            evaluations[0]["fuzzy_score"],
+            "no_match"
         )
 
     # --------------------------------------------------------
-    # If no strong match exists, return the best fuzzy fallback
-    # for debugging/API visibility, but do NOT match it.
+    # Rank strong matches.
     # --------------------------------------------------------
 
-    evaluations.sort(
+    strong_matches.sort(
         key=lambda item: (
             item["quality"],
             item["fuzzy_score"],
-            -item["edit_distance"],
-            item["suffix_matches"],
-            item["prefix_matches"],
+            -item["distance"],
         ),
         reverse=True
     )
 
-    best = evaluations[0]
+    best = strong_matches[0]
+
+    # --------------------------------------------------------
+    # Ambiguity protection.
+    # --------------------------------------------------------
+
+    if len(strong_matches) > 1:
+
+        second = strong_matches[1]
+
+        margin = (
+                best["quality"]
+                - second["quality"]
+        )
+
+        if (
+                best["fuzzy_score"] < 100.0
+                and margin < MIN_MATCH_MARGIN
+        ):
+
+            return (
+                None,
+                best["fuzzy_score"],
+                "ambiguous"
+            )
 
     return (
-        None,
+        best["reference"],
         best["fuzzy_score"],
-        "no_match"
+        "matched"
     )
 
 
 # ============================================================
-# DATABASE CONSENSUS
+# OCR CANDIDATE QUALITY
+# ============================================================
+
+def _ocr_candidate_quality(
+        cleaned_text,
+        confidence
+):
+    """
+    Rank OCR results by usefulness as vehicle registrations.
+
+    OCR confidence is only one small part of this score.
+
+    For example:
+
+        TT
+        confidence = 80
+
+    should rank below:
+
+        QL8C9G2956
+        confidence = 33
+
+    because the second one contains much more registration
+    information.
+    """
+
+    text = _normalize_plate(
+        cleaned_text
+    )
+
+    if not text:
+        return -1.0
+
+    # --------------------------------------------------------
+    # Length
+    # --------------------------------------------------------
+
+    if len(text) == 10:
+        length_score = 40.0
+
+    elif len(text) == 9:
+        length_score = 32.0
+
+    elif len(text) == 8:
+        length_score = 20.0
+
+    elif len(text) >= 6:
+        length_score = 10.0
+
+    else:
+        length_score = 0.0
+
+    # --------------------------------------------------------
+    # Mixed letters + digits
+    # --------------------------------------------------------
+
+    has_letters = any(
+        c.isalpha()
+        for c in text
+    )
+
+    has_digits = any(
+        c.isdigit()
+        for c in text
+    )
+
+    mixed_score = (
+        15.0
+        if has_letters and has_digits
+        else 0.0
+    )
+
+    # --------------------------------------------------------
+    # OCR confidence
+    #
+    # Deliberately low weighting.
+    # --------------------------------------------------------
+
+    try:
+        confidence_value = float(
+            confidence
+        )
+    except (
+            TypeError,
+            ValueError
+    ):
+        confidence_value = 0.0
+
+    confidence_value = min(
+        max(
+            confidence_value,
+            0.0
+        ),
+        100.0
+    )
+
+    confidence_score = (
+            confidence_value * 0.15
+    )
+
+    return (
+            length_score
+            + mixed_score
+            + confidence_score
+    )
+
+
+# ============================================================
+# ALL OCR CANDIDATES → DATABASE
 # ============================================================
 
 def find_best_match_across_candidates(
-        ocr_candidates: list,
-        reference_plates: list
+        ocr_candidates,
+        reference_plates
 ):
     """
-    Match ALL OCR candidates against the complete database.
+    Compare all OCR candidates against the entire database.
 
-    This is where the system becomes much more database-aware.
+    This is the main database-aware matching function.
 
-    Multiple preprocessing/OCR variants that independently point
-    toward the same DB plate increase confidence.
+    It does NOT blindly trust the highest EasyOCR confidence.
 
-    We intentionally use diminishing returns so that generating
-    20 identical preprocessing variants does not artificially
-    make one plate unbeatable.
+    It can identify a lower-confidence OCR result when that
+    result strongly agrees with a registered DB plate.
     """
 
-    if not ocr_candidates or not reference_plates:
+    # ========================================================
+    # NO OCR
+    # ========================================================
+
+    if not ocr_candidates:
+
         return (
             "",
             "",
@@ -676,23 +1105,13 @@ def find_best_match_across_candidates(
             "no_match"
         )
 
-    # --------------------------------------------------------
-    # For each DB plate, retain the strongest distinct OCR
-    # observations.
+    # ========================================================
+    # BEST OCR FALLBACK
     #
-    # Structure:
-    #
-    # {
-    #     reference_id: {
-    #         cleaned_text: observation
-    #     }
-    # }
-    # --------------------------------------------------------
+    # Used only when there is no database match.
+    # ========================================================
 
-    evidence_by_reference = {}
-
-    # Also retain the best fallback candidate for debugging.
-    best_fallback = None
+    best_ocr = None
 
     for raw_text, confidence in ocr_candidates:
 
@@ -700,14 +1119,14 @@ def find_best_match_across_candidates(
             continue
 
         try:
-            ocr_confidence = float(
+            conf = float(
                 confidence
             )
         except (
                 TypeError,
                 ValueError
         ):
-            ocr_confidence = 0.0
+            conf = 0.0
 
         cleaned_options = (
             clean_text_candidates(
@@ -717,16 +1136,13 @@ def find_best_match_across_candidates(
 
         if not cleaned_options:
 
-            fallback_cleaned = _normalize_plate(
-                raw_text
-            )
+            cleaned_options = [
+                _normalize_plate(
+                    raw_text
+                )
+            ]
 
-            if fallback_cleaned:
-                cleaned_options = [
-                    fallback_cleaned
-                ]
-
-        # Avoid duplicate cleaner outputs for the same OCR.
+        # Remove duplicates.
         cleaned_options = list(
             dict.fromkeys(
                 cleaned_options
@@ -742,122 +1158,41 @@ def find_best_match_across_candidates(
             if not cleaned:
                 continue
 
-            # ------------------------------------------------
-            # Evaluate against EVERY database plate.
-            # ------------------------------------------------
-
-            for reference_plate in reference_plates:
-
-                evaluation = _evaluate_reference(
+            candidate_quality = (
+                _ocr_candidate_quality(
                     cleaned,
-                    reference_plate
+                    conf
                 )
+            )
 
-                if evaluation is None:
-                    continue
-
-                # ------------------------------------------------
-                # Keep fallback regardless of whether it qualifies
-                # as a real match.
-                # ------------------------------------------------
-
-                fallback_item = (
-                    raw_text,
-                    cleaned,
-                    ocr_confidence,
-                    evaluation
-                )
-
-                if (
-                        best_fallback is None
-                        or evaluation["quality"]
-                        > best_fallback[3]["quality"]
-                ):
-                    best_fallback = fallback_item
-
-                # ------------------------------------------------
-                # Only strong relations participate in DB
-                # consensus.
-                # ------------------------------------------------
-
-                if not evaluation[
-                    "strong_match"
-                ]:
-                    continue
-
-                reference_id = reference_plate.get(
-                    "id",
-                    reference_plate.get(
-                        "plate_number"
-                    )
-                )
-
-                if reference_id not in evidence_by_reference:
-
-                    evidence_by_reference[
-                        reference_id
-                    ] = {
-                        "reference": reference_plate,
-                        "observations": {}
-                    }
-
-                observations = (
-                    evidence_by_reference[
-                        reference_id
-                    ]["observations"]
-                )
-
-                # ------------------------------------------------
-                # Same cleaned text appearing in 10 variants should
-                # count as ONE distinct observation.
-                #
-                # Keep only the strongest version.
-                # ------------------------------------------------
-
-                existing = observations.get(
-                    cleaned
-                )
-
-                if (
-                        existing is None
-                        or ocr_confidence
-                        > existing[
-                    "confidence"
-                ]
-                        or evaluation["quality"]
-                        > existing[
-                    "evaluation"
-                ]["quality"]
-                ):
-
-                    observations[
-                        cleaned
-                    ] = {
-                        "raw_text": raw_text,
-                        "cleaned_text": cleaned,
-                        "confidence": ocr_confidence,
-                        "evaluation": evaluation,
-                    }
-
-    # --------------------------------------------------------
-    # No strong DB relations.
-    # --------------------------------------------------------
-
-    if not evidence_by_reference:
-
-        if best_fallback is not None:
-
-            raw_text = best_fallback[0]
-            cleaned = best_fallback[1]
-            confidence = best_fallback[2]
-            evaluation = best_fallback[3]
-
-            return (
+            candidate = (
                 raw_text,
                 cleaned,
-                confidence,
+                conf,
+                candidate_quality
+            )
+
+            if (
+                    best_ocr is None
+                    or candidate_quality
+                    > best_ocr[3]
+            ):
+                best_ocr = candidate
+
+    # ========================================================
+    # DATABASE MISSING
+    # ========================================================
+
+    if not reference_plates:
+
+        if best_ocr is not None:
+
+            return (
+                best_ocr[0],
+                best_ocr[1],
+                best_ocr[2],
                 None,
-                evaluation["fuzzy_score"],
+                0.0,
                 "no_match"
             )
 
@@ -871,12 +1206,209 @@ def find_best_match_across_candidates(
         )
 
     # ========================================================
-    # SCORE EACH DATABASE PLATE USING CONSENSUS
+    # DATABASE EVIDENCE
     # ========================================================
 
-    ranked_references = []
+    evidence = {}
 
-    for reference_id, data in evidence_by_reference.items():
+    # Best fuzzy relation, retained for debugging.
+    best_fallback = None
+
+    # ========================================================
+    # TEST EVERY OCR CANDIDATE AGAINST EVERY DB PLATE
+    # ========================================================
+
+    for raw_text, confidence in ocr_candidates:
+
+        if not raw_text:
+            continue
+
+        try:
+            conf = float(
+                confidence
+            )
+        except (
+                TypeError,
+                ValueError
+        ):
+            conf = 0.0
+
+        cleaned_options = (
+            clean_text_candidates(
+                raw_text
+            )
+        )
+
+        if not cleaned_options:
+
+            cleaned_options = [
+                _normalize_plate(
+                    raw_text
+                )
+            ]
+
+        cleaned_options = list(
+            dict.fromkeys(
+                cleaned_options
+            )
+        )
+
+        for cleaned in cleaned_options:
+
+            cleaned = _normalize_plate(
+                cleaned
+            )
+
+            if not cleaned:
+                continue
+
+            for reference_plate in reference_plates:
+
+                evaluation = _evaluate_reference(
+                    cleaned,
+                    reference_plate
+                )
+
+                if evaluation is None:
+                    continue
+
+                # ------------------------------------------------
+                # Preserve best fuzzy/structural fallback.
+                # ------------------------------------------------
+
+                fallback = (
+                    raw_text,
+                    cleaned,
+                    conf,
+                    evaluation
+                )
+
+                if (
+                        best_fallback is None
+                        or evaluation["quality"]
+                        > best_fallback[3]["quality"]
+                ):
+                    best_fallback = fallback
+
+                # ------------------------------------------------
+                # Only strong evidence can identify a plate.
+                # ------------------------------------------------
+
+                if not evaluation[
+                    "strong_match"
+                ]:
+                    continue
+
+                reference_id = (
+                    reference_plate.get(
+                        "id",
+                        reference_plate.get(
+                            "plate_number"
+                        )
+                    )
+                )
+
+                if reference_id not in evidence:
+
+                    evidence[
+                        reference_id
+                    ] = {
+                        "reference":
+                            reference_plate,
+
+                        "observations":
+                            {}
+                    }
+
+                observations = evidence[
+                    reference_id
+                ]["observations"]
+
+                # Same cleaned OCR interpretation repeated over
+                # many preprocessing variants counts as one
+                # distinct observation.
+                existing = observations.get(
+                    cleaned
+                )
+
+                if (
+                        existing is None
+                        or conf > existing[
+                    "confidence"
+                ]
+                        or evaluation["quality"]
+                        > existing[
+                    "evaluation"
+                ]["quality"]
+                ):
+
+                    observations[
+                        cleaned
+                    ] = {
+                        "raw_text":
+                            raw_text,
+
+                        "cleaned_text":
+                            cleaned,
+
+                        "confidence":
+                            conf,
+
+                        "evaluation":
+                            evaluation,
+                    }
+
+    # ========================================================
+    # NO STRONG DATABASE MATCH
+    # ========================================================
+
+    if not evidence:
+
+        # IMPORTANT:
+        #
+        # We still return useful OCR information.
+        #
+        # A failed DB match is not the same thing as
+        # "no plate detected".
+        #
+
+        if best_ocr is not None:
+
+            fallback_score = 0.0
+
+            if best_fallback is not None:
+
+                fallback_score = (
+                    best_fallback[3][
+                        "fuzzy_score"
+                    ]
+                )
+
+            return (
+                best_ocr[0],
+                best_ocr[1],
+                best_ocr[2],
+                None,
+                fallback_score,
+                "no_match"
+            )
+
+        return (
+            "",
+            "",
+            0.0,
+            None,
+            0.0,
+            "no_match"
+        )
+
+    # ========================================================
+    # RANK DATABASE RECORDS
+    # ========================================================
+
+    ranked = []
+
+    for reference_id, data in evidence.items():
 
         observations = list(
             data["observations"].values()
@@ -885,7 +1417,7 @@ def find_best_match_across_candidates(
         if not observations:
             continue
 
-        # Best individual OCR interpretation.
+        # Strongest observation first.
         observations.sort(
             key=lambda item: (
                 item["evaluation"]["quality"],
@@ -895,10 +1427,12 @@ def find_best_match_across_candidates(
             reverse=True
         )
 
-        best_observation = observations[0]
+        best_observation = observations[
+            0
+        ]
 
         # ----------------------------------------------------
-        # Base = best structural evidence.
+        # Main score
         # ----------------------------------------------------
 
         rank_score = (
@@ -907,80 +1441,66 @@ def find_best_match_across_candidates(
             ]["quality"]
         )
 
-        # ----------------------------------------------------
-        # OCR confidence is deliberately secondary.
-        #
-        # OCR confidence tells us how confident EasyOCR was,
-        # not whether the database identification is correct.
-        # ----------------------------------------------------
-
-        confidence_bonus = min(
-            max(
-                best_observation[
-                    "confidence"
-                ],
-                0.0
-            ),
-            100.0
-        ) * 0.03
-
+        # OCR confidence contributes only a little.
         rank_score += (
-            confidence_bonus
+                min(
+                    max(
+                        best_observation[
+                            "confidence"
+                        ],
+                        0.0
+                    ),
+                    100.0
+                )
+                * 0.02
         )
 
         # ----------------------------------------------------
-        # Consensus bonus.
+        # Distinct OCR consensus
         #
-        # Distinct cleaned strings independently pointing at the
-        # same DB plate are useful evidence.
-        #
-        # Diminishing returns:
-        #
-        # 2nd interpretation → +3
-        # 3rd interpretation → +2
-        # 4th+              → +1 each up to +3 total
-        #
-        # This prevents 20 identical preprocessing variants
-        # from overwhelming the system.
+        # Repeating one identical result 20 times does not
+        # create 20 votes.
         # ----------------------------------------------------
 
-        distinct_support = len(
+        support = len(
             observations
         )
 
-        if distinct_support >= 2:
+        if support >= 2:
             rank_score += 3.0
 
-        if distinct_support >= 3:
+        if support >= 3:
             rank_score += 2.0
 
-        if distinct_support >= 4:
+        if support >= 4:
             rank_score += min(
-                distinct_support - 3,
+                support - 3,
                 3
-            ) * 1.0
+            )
 
-        ranked_references.append(
+        ranked.append(
             {
-                "reference": data[
-                    "reference"
-                ],
+                "reference":
+                    data["reference"],
+
                 "best_observation":
                     best_observation,
-                "support_count":
-                    distinct_support,
-                "rank_score":
+
+                "support":
+                    support,
+
+                "score":
                     rank_score,
             }
         )
 
-    # --------------------------------------------------------
-    # Sort DB candidates.
-    # --------------------------------------------------------
+    # ========================================================
+    # SORT
+    # ========================================================
 
-    ranked_references.sort(
+    ranked.sort(
         key=lambda item: (
-            item["rank_score"],
+            item["score"],
             item["best_observation"][
                 "evaluation"
             ]["quality"],
@@ -991,19 +1511,41 @@ def find_best_match_across_candidates(
         reverse=True
     )
 
-    best = ranked_references[0]
+    if not ranked:
 
-    # --------------------------------------------------------
-    # Ambiguity protection.
-    # --------------------------------------------------------
+        if best_ocr is not None:
 
-    if len(ranked_references) > 1:
+            return (
+                best_ocr[0],
+                best_ocr[1],
+                best_ocr[2],
+                None,
+                0.0,
+                "no_match"
+            )
 
-        second = ranked_references[1]
+        return (
+            "",
+            "",
+            0.0,
+            None,
+            0.0,
+            "no_match"
+        )
+
+    best = ranked[0]
+
+    # ========================================================
+    # AMBIGUITY PROTECTION
+    # ========================================================
+
+    if len(ranked) > 1:
+
+        second = ranked[1]
 
         margin = (
-                best["rank_score"]
-                - second["rank_score"]
+                best["score"]
+                - second["score"]
         )
 
         best_evaluation = (
@@ -1012,7 +1554,7 @@ def find_best_match_across_candidates(
             ]
         )
 
-        # Exact match is never considered ambiguous.
+        # Exact matches don't need ambiguity protection.
         if (
                 best_evaluation[
                     "fuzzy_score"
@@ -1020,44 +1562,49 @@ def find_best_match_across_candidates(
                 and margin < MIN_MATCH_MARGIN
         ):
 
-            observation = best[
-                "best_observation"
-            ]
+            observation = (
+                best["best_observation"]
+            )
 
             return (
-                observation["raw_text"],
-                observation["cleaned_text"],
-                observation["confidence"],
-                None,
                 observation[
-                    "evaluation"
-                ]["fuzzy_score"],
+                    "raw_text"
+                ],
+                observation[
+                    "cleaned_text"
+                ],
+                observation[
+                    "confidence"
+                ],
+                None,
+                best_evaluation[
+                    "fuzzy_score"
+                ],
                 "ambiguous"
             )
 
-    # --------------------------------------------------------
-    # Final matched DB record.
-    # --------------------------------------------------------
+    # ========================================================
+    # FINAL MATCH
+    # ========================================================
 
-    observation = best[
-        "best_observation"
-    ]
+    observation = (
+        best["best_observation"]
+    )
 
-    candidate = best[
-        "reference"
-    ]
+    candidate = (
+        best["reference"]
+    )
 
     evaluation = observation[
         "evaluation"
     ]
 
     # --------------------------------------------------------
-    # Strict status protection.
+    # Strict statuses
     #
-    # There is intentionally NO reduced threshold here.
-    #
-    # A stolen/blacklisted record must already satisfy our
-    # structural strong-match rules.
+    # They already passed _strong_match().
+    # We therefore do not use a separate arbitrary fuzzy
+    # threshold such as 92%.
     # --------------------------------------------------------
 
     status = str(
@@ -1074,19 +1621,35 @@ def find_best_match_across_candidates(
         ]:
 
             return (
-                observation["raw_text"],
-                observation["cleaned_text"],
-                observation["confidence"],
+                observation[
+                    "raw_text"
+                ],
+                observation[
+                    "cleaned_text"
+                ],
+                observation[
+                    "confidence"
+                ],
                 None,
-                evaluation["fuzzy_score"],
+                evaluation[
+                    "fuzzy_score"
+                ],
                 "no_match"
             )
 
     return (
-        observation["raw_text"],
-        observation["cleaned_text"],
-        observation["confidence"],
+        observation[
+            "raw_text"
+        ],
+        observation[
+            "cleaned_text"
+        ],
+        observation[
+            "confidence"
+        ],
         candidate,
-        evaluation["fuzzy_score"],
+        evaluation[
+            "fuzzy_score"
+        ],
         "matched"
     )
