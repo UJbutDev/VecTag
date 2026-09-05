@@ -1,26 +1,246 @@
-import shutil
-import uuid
 import os
+import uuid
 import cv2
-from datetime import datetime
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 
-from detection.detect_plate import detect_plate_region
-from detection.preprocess import preprocess_plate_variants
-from detection.ocr import run_ocr, synthesize_voted_candidate
-from detection.match import find_best_match_across_candidates
-from detection.db import get_all_reference_plates, camera_exists, insert_detection
+from datetime import datetime
+
+from fastapi import (
+    APIRouter,
+    UploadFile,
+    File,
+    Form,
+    HTTPException
+)
+
+from detection.detect_plate import (
+    detect_plate_region
+)
+
+from detection.preprocess import (
+    preprocess_plate_variants
+)
+
+from detection.ocr import (
+    run_ocr,
+    synthesize_voted_candidate
+)
+
+from detection.match import (
+    find_best_match_across_candidates
+)
+
+from detection.db import (
+    get_all_reference_plates,
+    camera_exists,
+    insert_detection
+)
+
 
 router = APIRouter()
 
+
+# ============================================================
+# DIRECTORIES
+# ============================================================
+
 UPLOAD_DIR = "uploads"
+
 DEBUG_DIR = "debug_output"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(DEBUG_DIR, exist_ok=True)
+
+os.makedirs(
+    UPLOAD_DIR,
+    exist_ok=True
+)
+
+os.makedirs(
+    DEBUG_DIR,
+    exist_ok=True
+)
+
+
+# ============================================================
+# DEBUG
+# ============================================================
 
 SAVE_DEBUG_IMAGES = True
-DEBUG_LOG = True
 
+
+# ============================================================
+# DATABASE MATCH
+# ============================================================
+
+def _database_match(
+        candidates,
+        reference_plates
+):
+    """
+    Call the existing database-aware matcher.
+    """
+
+    if not candidates:
+
+        return (
+            "",
+            "",
+            0.0,
+            None,
+            0.0,
+            "no_match"
+        )
+
+    return find_best_match_across_candidates(
+        candidates,
+        reference_plates
+    )
+
+
+# ============================================================
+# OCR STAGE
+# ============================================================
+
+def _run_ocr_stage(
+        variants,
+        ocr_candidates,
+        reference_plates,
+        stage_name,
+        crop_i
+):
+    """
+    OCR each variant and perform a DB cross-check immediately
+    after useful OCR output.
+
+    Returns:
+        matched result or None
+    """
+
+    for variant_i, variant in enumerate(
+            variants
+    ):
+
+        # ----------------------------------------------------
+        # Save debug image
+        # ----------------------------------------------------
+
+        if SAVE_DEBUG_IMAGES:
+
+            filename = (
+                f"processed_{crop_i}_"
+                f"{stage_name}_{variant_i}.png"
+            )
+
+            try:
+
+                cv2.imwrite(
+                    os.path.join(
+                        DEBUG_DIR,
+                        filename
+                    ),
+                    variant
+                )
+
+            except Exception as exc:
+
+                print(
+                    "[router debug] "
+                    f"debug image save failed: {exc}"
+                )
+
+        # ----------------------------------------------------
+        # OCR
+        # ----------------------------------------------------
+
+        try:
+
+            text, confidence = run_ocr(
+                variant
+            )
+
+        except Exception as exc:
+
+            print(
+                "[router debug] "
+                f"OCR failed: {exc}"
+            )
+
+            text = ""
+            confidence = 0.0
+
+        ocr_candidates.append(
+            (
+                text,
+                confidence
+            )
+        )
+
+        candidate_number = (
+                len(ocr_candidates) - 1
+        )
+
+        print(
+            "[router debug] "
+            f"candidate_{candidate_number}: "
+            f"raw='{text}' "
+            f"conf={confidence}"
+        )
+
+        # Empty OCR cannot produce a DB match.
+        if not text:
+            continue
+
+        # ----------------------------------------------------
+        # DATABASE CROSS-CHECK
+        # ----------------------------------------------------
+
+        try:
+
+            result = _database_match(
+                ocr_candidates,
+                reference_plates
+            )
+
+        except Exception as exc:
+
+            print(
+                "[router debug] "
+                f"database check failed: {exc}"
+            )
+
+            continue
+
+        (
+            raw_text,
+            cleaned_text,
+            final_confidence,
+            matched_plate,
+            match_score,
+            match_status
+        ) = result
+
+        if (
+                match_status == "matched"
+                and matched_plate is not None
+        ):
+
+            print(
+                "[router debug] "
+                "EARLY DATABASE MATCH"
+            )
+
+            print(
+                "[router debug] "
+                f"matched_plate="
+                f"'{matched_plate.get('plate_number')}' "
+                f"score={match_score}"
+            )
+
+            return result
+
+    return None
+
+
+# ============================================================
+# SCAN
+# ============================================================
 
 @router.post("/scan")
 async def scan_plate(
@@ -28,80 +248,390 @@ async def scan_plate(
         camera_id: int = Form(...),
         detected_at: str = Form(None)
 ):
-    if not camera_exists(camera_id):
-        raise HTTPException(status_code=400, detail="invalid camera_id")
 
-    temp_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}_{image.filename}")
-    with open(temp_path, "wb") as f:
-        shutil.copyfileobj(image.file, f)
+    # ========================================================
+    # CAMERA VALIDATION
+    # ========================================================
 
-    # detect_plate_region now returns a LIST of candidate crops (usually
-    # 1, but 2 when YOLO's best box was low-confidence and the contour
-    # fallback was also tried). Cross-candidate OCR+DB-matching decides
-    # which crop, if either, actually produced a real plate reading.
-    plate_crops = detect_plate_region(temp_path)
+    if not camera_exists(
+            camera_id
+    ):
+
+        raise HTTPException(
+            status_code=400,
+            detail="invalid_camera_id"
+        )
+
+    # ========================================================
+    # SAVE INPUT
+    # ========================================================
+
+    temp_filename = (
+        f"{uuid.uuid4()}_"
+        f"{image.filename}"
+    )
+
+    temp_path = os.path.join(
+        UPLOAD_DIR,
+        temp_filename
+    )
+
+    with open(
+            temp_path,
+            "wb"
+    ) as file:
+
+        file.write(
+            await image.read()
+        )
+
+    # ========================================================
+    # YOLO
+    # ========================================================
+
+    plate_crops = detect_plate_region(
+        temp_path
+    )
+
     if not plate_crops:
-        return {"error": "no_plate_detected"}
+
+        return {
+            "error":
+                "no_plate_detected",
+
+            "camera_id":
+                camera_id
+        }
+
+    print(
+        "[router debug] "
+        f"YOLO returned "
+        f"{len(plate_crops)} crop(s)"
+    )
+
+    # ========================================================
+    # LOAD REFERENCE DB ONCE
+    # ========================================================
+
+    reference_plates = (
+        get_all_reference_plates()
+    )
+
+    # ========================================================
+    # OCR CANDIDATES
+    # ========================================================
 
     ocr_candidates = []
-    for crop_i, plate_crop in enumerate(plate_crops):
+
+    early_match = None
+
+    # ========================================================
+    # EACH YOLO CROP
+    # ========================================================
+
+    for crop_i, plate_crop in enumerate(
+            plate_crops
+    ):
+
+        # ----------------------------------------------------
+        # Save raw crop
+        # ----------------------------------------------------
+
         if SAVE_DEBUG_IMAGES:
-            cv2.imwrite(os.path.join(DEBUG_DIR, f"crop_{crop_i}_{image.filename}"), plate_crop)
 
-        variants = preprocess_plate_variants(plate_crop)
+            crop_filename = (
+                f"crop_{crop_i}_"
+                f"{image.filename}"
+            )
 
-        if SAVE_DEBUG_IMAGES:
-            for i, v in enumerate(variants):
-                cv2.imwrite(os.path.join(DEBUG_DIR, f"processed_{crop_i}_{i}_{image.filename}"), v)
+            try:
 
-        ocr_candidates.extend(run_ocr(v) for v in variants)
+                cv2.imwrite(
+                    os.path.join(
+                        DEBUG_DIR,
+                        crop_filename
+                    ),
+                    plate_crop
+                )
 
-    voted_text, voted_conf = synthesize_voted_candidate(ocr_candidates)
+            except Exception as exc:
+
+                print(
+                    "[router debug] "
+                    f"crop save failed: {exc}"
+                )
+
+        # ====================================================
+        # FAST PATH
+        # ====================================================
+
+        print(
+            "[router debug] "
+            f"starting FAST scan for crop {crop_i}"
+        )
+
+        fast_variants = (
+            preprocess_plate_variants(
+                plate_crop,
+                hard=False
+            )
+        )
+
+        print(
+            "[router debug] "
+            f"FAST variants={len(fast_variants)}"
+        )
+
+        early_match = _run_ocr_stage(
+            fast_variants,
+            ocr_candidates,
+            reference_plates,
+            "fast",
+            crop_i
+        )
+
+        if early_match is not None:
+            break
+
+        # ====================================================
+        # HARD PATH
+        # ====================================================
+
+        print(
+            "[router debug] "
+            f"FAST exhausted for crop {crop_i}"
+        )
+
+        print(
+            "[router debug] "
+            "starting HARD recovery"
+        )
+
+        hard_variants = (
+            preprocess_plate_variants(
+                plate_crop,
+                hard=True
+            )
+        )
+
+        print(
+            "[router debug] "
+            f"HARD variants={len(hard_variants)}"
+        )
+
+        early_match = _run_ocr_stage(
+            hard_variants,
+            ocr_candidates,
+            reference_plates,
+            "hard",
+            crop_i
+        )
+
+        if early_match is not None:
+            break
+
+    # ========================================================
+    # OCR FAILED COMPLETELY
+    # ========================================================
+
+    if not any(
+            text
+            for text, _ in ocr_candidates
+    ):
+
+        return {
+            "error":
+                "ocr_failed",
+
+            "camera_id":
+                camera_id
+        }
+
+    # ========================================================
+    # EXISTING OCR VOTING
+    # ========================================================
+
+    voted_text, voted_conf = (
+        synthesize_voted_candidate(
+            ocr_candidates
+        )
+    )
+
+    print(
+        "[router debug] "
+        f"voted: raw='{voted_text}' "
+        f"conf={voted_conf}"
+    )
+
     if voted_text:
-        ocr_candidates.append((voted_text, voted_conf))
 
-    reference_plates = get_all_reference_plates()
+        ocr_candidates.append(
+            (
+                voted_text,
+                voted_conf
+            )
+        )
 
-    raw_text, cleaned, confidence, matched_plate, match_score, match_status = \
-        find_best_match_across_candidates(ocr_candidates, reference_plates)
+    # ========================================================
+    # FINAL DATABASE MATCH
+    # ========================================================
 
-    if DEBUG_LOG:
-        for i, (text, conf) in enumerate(ocr_candidates):
-            label = "voted" if voted_text and i == len(ocr_candidates) - 1 else f"candidate_{i}"
-            print(f"[router debug] {label}: raw={text!r} conf={conf}")
-        print(f"[router debug] CHOSEN: raw={raw_text!r} cleaned={cleaned!r} "
-              f"score={match_score} status={match_status}")
+    (
+        raw_text,
+        cleaned_text,
+        confidence,
+        matched_plate,
+        match_score,
+        match_status
+    ) = _database_match(
+        ocr_candidates,
+        reference_plates
+    )
 
-    if not raw_text:
-        return {"error": "no_plate_detected"}
+    # ========================================================
+    # EARLY MATCH SAFETY
+    #
+    # If a strong early match existed but the voted result
+    # doesn't reproduce it, keep the already validated match.
+    # ========================================================
+
+    if (
+            early_match is not None
+            and (
+            match_status != "matched"
+            or matched_plate is None
+    )
+    ):
+
+        (
+            raw_text,
+            cleaned_text,
+            confidence,
+            matched_plate,
+            match_score,
+            match_status
+        ) = early_match
+
+    # ========================================================
+    # DEBUG SUMMARY
+    # ========================================================
+
+    for i, (
+            text,
+            conf
+    ) in enumerate(
+        ocr_candidates
+    ):
+
+        print(
+            "[router debug] "
+            f"candidate_{i}: "
+            f"raw={text!r} "
+            f"conf={conf}"
+        )
+
+    print(
+        "[router debug] "
+        f"CHOSEN: "
+        f"raw={raw_text!r} "
+        f"cleaned={cleaned_text!r} "
+        f"score={match_score} "
+        f"status={match_status}"
+    )
+
+    # ========================================================
+    # SAVE DETECTION
+    # ========================================================
 
     row = {
-        "raw_text": raw_text,
-        "cleaned_text": cleaned,
-        "confidence": confidence,
-        "camera_id": camera_id,
-        "matched_plate_id": matched_plate["id"] if matched_plate else None,
-        "match_score": match_score,
-        "match_status": match_status,
-        "detected_at": detected_at or datetime.utcnow().isoformat(),
-        "image_path": temp_path
+        "raw_text":
+            raw_text,
+
+        "cleaned_text":
+            cleaned_text,
+
+        "confidence":
+            confidence,
+
+        "camera_id":
+            camera_id,
+
+        "matched_plate_id":
+            (
+                matched_plate["id"]
+                if matched_plate
+                else None
+            ),
+
+        "match_score":
+            match_score,
+
+        "match_status":
+            match_status,
+
+        "detected_at":
+            (
+                    detected_at
+                    or datetime.utcnow().isoformat()
+            ),
+
+        "image_path":
+            temp_path
     }
 
-    inserted = insert_detection(row)
+    inserted = insert_detection(
+        row
+    )
 
-    response = {
-        "raw_text": raw_text,
-        "cleaned_text": cleaned,
-        "confidence": confidence,
-        "camera_id": camera_id,
-        "match_status": match_status,
-        "matched_plate": {
-            "plate_number": matched_plate["plate_number"],
-            "owner_name": matched_plate.get("owner_name"),
-            "status": matched_plate.get("status")
-        } if matched_plate else None,
-        "match_score": match_score,
-        "detection_id": inserted["id"] if inserted else None
+    # ========================================================
+    # API RESPONSE
+    # ========================================================
+
+    return {
+        "raw_text":
+            raw_text,
+
+        "cleaned_text":
+            cleaned_text,
+
+        "confidence":
+            confidence,
+
+        "camera_id":
+            camera_id,
+
+        "match_status":
+            match_status,
+
+        "matched_plate":
+            (
+                {
+                    "plate_number":
+                        matched_plate[
+                            "plate_number"
+                        ],
+
+                    "owner_name":
+                        matched_plate.get(
+                            "owner_name"
+                        ),
+
+                    "status":
+                        matched_plate.get(
+                            "status"
+                        )
+                }
+                if matched_plate
+                else None
+            ),
+
+        "match_score":
+            match_score,
+
+        "detection_id":
+            (
+                inserted["id"]
+                if inserted
+                else None
+            )
     }
-
-    return response

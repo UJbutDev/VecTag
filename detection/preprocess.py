@@ -4,69 +4,133 @@ import numpy as np
 from detection.super_res import maybe_super_resolve
 
 
-def _deskew(gray_img):
-    edges = cv2.Canny(gray_img, 50, 150)
-    coords = np.column_stack(np.where(edges > 0))
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
 
-    if len(coords) < 20:
-        return gray_img
+def _to_gray(image):
+    """
+    Safely convert grayscale, BGR, or BGRA images to grayscale.
+    """
 
-    rect = cv2.minAreaRect(coords)
-    angle = rect[-1]
+    if image is None:
+        return None
 
-    if angle < -45:
-        angle = 90 + angle
+    if len(image.shape) == 2:
+        return image
 
-    if abs(angle) > 20:
-        return gray_img
+    if len(image.shape) != 3:
+        return None
 
-    (h, w) = gray_img.shape[:2]
-    center = (w // 2, h // 2)
+    channels = image.shape[2]
 
-    M = cv2.getRotationMatrix2D(center, -angle, 1.0)
+    if channels == 1:
+        return image[:, :, 0]
 
-    return cv2.warpAffine(
-        gray_img,
-        M,
-        (w, h),
-        flags=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_REPLICATE
+    if channels == 3:
+        return cv2.cvtColor(
+            image,
+            cv2.COLOR_BGR2GRAY
+        )
+
+    if channels == 4:
+        return cv2.cvtColor(
+            image,
+            cv2.COLOR_BGRA2GRAY
+        )
+
+    return None
+
+
+def _resize_for_ocr(gray):
+    """
+    Upscale small plate images to a useful OCR height.
+    """
+
+    if gray is None:
+        return None
+
+    h, w = gray.shape[:2]
+
+    if h <= 0 or w <= 0:
+        return gray
+
+    target_height = 100
+
+    scale = target_height / float(h)
+
+    # Never downscale.
+    scale = max(
+        1.0,
+        scale
+    )
+
+    new_w = max(
+        120,
+        int(round(w * scale))
+    )
+
+    new_h = max(
+        40,
+        int(round(h * scale))
+    )
+
+    return cv2.resize(
+        gray,
+        (new_w, new_h),
+        interpolation=cv2.INTER_CUBIC
     )
 
 
-def _adaptive_enhance(gray_img):
-    mean_brightness = gray_img.mean()
+def _adaptive_enhance(gray):
+    """
+    Moderate CLAHE/gamma enhancement.
+    """
+
+    if gray is None:
+        return None
+
+    mean_brightness = float(
+        gray.mean()
+    )
 
     if mean_brightness < 80:
-        clip = 3.5
-    elif mean_brightness < 150:
+        clip = 3.0
+
+    elif mean_brightness < 160:
         clip = 2.0
+
     else:
-        clip = 1.2
+        clip = 1.3
 
     clahe = cv2.createCLAHE(
         clipLimit=clip,
         tileGridSize=(8, 8)
     )
 
-    enhanced = clahe.apply(gray_img)
+    enhanced = clahe.apply(
+        gray
+    )
 
-    if mean_brightness < 90:
-        gamma = 1.5
-    elif mean_brightness > 180:
-        gamma = 0.8
-    else:
-        gamma = 1.0
+    # Only apply gamma to very dark crops.
+    if mean_brightness < 65:
 
-    if gamma != 1.0:
+        gamma = 1.35
+
         inv_gamma = 1.0 / gamma
 
-        table = np.array([
-            ((i / 255.0) ** inv_gamma) * 255
-            for i in range(256)
-        ]).astype("uint8")
+        table = np.array(
+            [
+                ((i / 255.0) ** inv_gamma) * 255
+                for i in range(256)
+            ],
+            dtype=np.uint8
+        )
 
-        enhanced = cv2.LUT(enhanced, table)
+        enhanced = cv2.LUT(
+            enhanced,
+            table
+        )
 
     return enhanced
 
@@ -74,11 +138,11 @@ def _adaptive_enhance(gray_img):
 def _order_points(points):
     """
     Return points in:
+
         top-left
         top-right
         bottom-right
         bottom-left
-    order.
     """
 
     points = np.asarray(
@@ -91,48 +155,114 @@ def _order_points(points):
         dtype=np.float32
     )
 
-    sums = points.sum(axis=1)
+    sums = points.sum(
+        axis=1
+    )
+
     diffs = np.diff(
         points,
         axis=1
     ).reshape(-1)
 
-    result[0] = points[np.argmin(sums)]   # top-left
-    result[2] = points[np.argmax(sums)]   # bottom-right
-    result[1] = points[np.argmin(diffs)]  # top-right
-    result[3] = points[np.argmax(diffs)]  # bottom-left
+    result[0] = points[
+        np.argmin(sums)
+    ]
+
+    result[2] = points[
+        np.argmax(sums)
+    ]
+
+    result[1] = points[
+        np.argmin(diffs)
+    ]
+
+    result[3] = points[
+        np.argmax(diffs)
+    ]
 
     return result
 
 
-def _perspective_correct(plate_img):
+def _rotate_bound(
+        image,
+        angle
+):
     """
-    Straighten a tilted license plate.
-
-    First tries to detect the plate rectangle.
-    If that fails, falls back to detecting the dominant
-    long horizontal edge angle and rotating the crop.
-
-    Returns:
-        corrected image, or None
+    Rotate without clipping the image.
     """
 
-    if plate_img is None or plate_img.size == 0:
+    if image is None:
         return None
 
-    h, w = plate_img.shape[:2]
+    h, w = image.shape[:2]
 
-    if w < 80 or h < 30:
-        return None
-
-    gray = cv2.cvtColor(
-        plate_img,
-        cv2.COLOR_BGR2GRAY
+    center = (
+        w / 2.0,
+        h / 2.0
     )
 
-    # ---------------------------------------------------------
-    # 1. TRY TO FIND THE WHITE PLATE AS A QUADRILATERAL
-    # ---------------------------------------------------------
+    matrix = cv2.getRotationMatrix2D(
+        center,
+        angle,
+        1.0
+    )
+
+    cos = abs(
+        matrix[0, 0]
+    )
+
+    sin = abs(
+        matrix[0, 1]
+    )
+
+    new_w = int(
+        (h * sin)
+        + (w * cos)
+    )
+
+    new_h = int(
+        (h * cos)
+        + (w * sin)
+    )
+
+    matrix[0, 2] += (
+            new_w / 2.0
+            - center[0]
+    )
+
+    matrix[1, 2] += (
+            new_h / 2.0
+            - center[1]
+    )
+
+    return cv2.warpAffine(
+        image,
+        matrix,
+        (
+            new_w,
+            new_h
+        ),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE
+    )
+
+
+# ============================================================
+# PLATE MASK GENERATION
+# ============================================================
+
+def _plate_masks(
+        gray,
+        color
+):
+    """
+    Generate masks that may isolate the physical plate.
+    """
+
+    masks = []
+
+    if gray is None:
+        return masks
 
     blur = cv2.GaussianBlur(
         gray,
@@ -140,46 +270,187 @@ def _perspective_correct(plate_img):
         0
     )
 
-    # White/light plate region
-    _, thresh = cv2.threshold(
+    # --------------------------------------------------------
+    # Otsu
+    # --------------------------------------------------------
+
+    _, otsu = cv2.threshold(
         blur,
         0,
         255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        cv2.THRESH_BINARY +
+        cv2.THRESH_OTSU
     )
 
-    # Connect the plate area
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT,
-        (15, 7)
+    masks.append(
+        otsu
     )
 
-    thresh = cv2.morphologyEx(
-        thresh,
-        cv2.MORPH_CLOSE,
-        kernel,
-        iterations=2
+    # --------------------------------------------------------
+    # Adaptive
+    # --------------------------------------------------------
+
+    adaptive = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        -5
     )
 
-    contours, _ = cv2.findContours(
-        thresh,
+    masks.append(
+        adaptive
+    )
+
+    # --------------------------------------------------------
+    # Bright / low-saturation region
+    # --------------------------------------------------------
+
+    if (
+            color is not None
+            and len(color.shape) == 3
+            and color.shape[2] == 3
+    ):
+
+        hsv = cv2.cvtColor(
+            color,
+            cv2.COLOR_BGR2HSV
+        )
+
+        lower_white = np.array(
+            [0, 0, 125],
+            dtype=np.uint8
+        )
+
+        upper_white = np.array(
+            [180, 110, 255],
+            dtype=np.uint8
+        )
+
+        white_mask = cv2.inRange(
+            hsv,
+            lower_white,
+            upper_white
+        )
+
+        masks.append(
+            white_mask
+        )
+
+    return masks
+
+
+# ============================================================
+# QUADRILATERAL PLATE DETECTION
+# ============================================================
+
+def _find_plate_quad(
+        plate_img
+):
+    """
+    Search for a wide quadrilateral representing the physical
+    number plate inside the YOLO crop.
+    """
+
+    if plate_img is None:
+        return None
+
+    gray = _to_gray(
+        plate_img
+    )
+
+    if gray is None:
+        return None
+
+    h, w = gray.shape[:2]
+
+    if w < 80 or h < 30:
+        return None
+
+    image_area = float(
+        w * h
+    )
+
+    contours = []
+
+    masks = _plate_masks(
+        gray,
+        plate_img
+    )
+
+    for mask in masks:
+
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (9, 5)
+        )
+
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            kernel,
+            iterations=2
+        )
+
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_OPEN,
+            np.ones(
+                (3, 3),
+                dtype=np.uint8
+            ),
+            iterations=1
+        )
+
+        found, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        if found:
+            contours.extend(
+                found
+            )
+
+    # --------------------------------------------------------
+    # Edge contours
+    # --------------------------------------------------------
+
+    edges = cv2.Canny(
+        gray,
+        40,
+        140
+    )
+
+    edge_contours, _ = cv2.findContours(
+        edges,
         cv2.RETR_EXTERNAL,
         cv2.CHAIN_APPROX_SIMPLE
     )
 
-    image_area = float(w * h)
+    if edge_contours:
+        contours.extend(
+            edge_contours
+        )
+
+    if not contours:
+        return None
 
     best_quad = None
-    best_score = 0.0
+    best_score = -1.0
 
     for contour in contours:
 
-        area = cv2.contourArea(contour)
+        area = cv2.contourArea(
+            contour
+        )
 
-        if area < image_area * 0.03:
+        if area < image_area * 0.015:
             continue
 
-        if area > image_area * 0.95:
+        if area > image_area * 0.85:
             continue
 
         perimeter = cv2.arcLength(
@@ -190,160 +461,506 @@ def _perspective_correct(plate_img):
         if perimeter <= 0:
             continue
 
-        approx = cv2.approxPolyDP(
-            contour,
-            0.04 * perimeter,
-            True
-        )
+        for epsilon_factor in (
+                0.018,
+                0.025,
+                0.035,
+                0.045,
+                0.055
+        ):
 
-        if len(approx) != 4:
-            continue
-
-        points = approx.reshape(
-            4,
-            2
-        ).astype(np.float32)
-
-        rect = _order_points(points)
-
-        tl, tr, br, bl = rect
-
-        top_width = np.linalg.norm(
-            tr - tl
-        )
-
-        bottom_width = np.linalg.norm(
-            br - bl
-        )
-
-        left_height = np.linalg.norm(
-            bl - tl
-        )
-
-        right_height = np.linalg.norm(
-            br - tr
-        )
-
-        avg_width = (
-                            top_width +
-                            bottom_width
-                    ) / 2.0
-
-        avg_height = (
-                             left_height +
-                             right_height
-                     ) / 2.0
-
-        if avg_height <= 0:
-            continue
-
-        aspect_ratio = (
-                avg_width /
-                avg_height
-        )
-
-        if not 2.0 <= aspect_ratio <= 8.0:
-            continue
-
-        score = area * min(
-            aspect_ratio / 4.0,
-            1.0
-        )
-
-        if score > best_score:
-            best_score = score
-            best_quad = rect
-
-    # ---------------------------------------------------------
-    # 2. QUADRILATERAL FOUND
-    # ---------------------------------------------------------
-
-    if best_quad is not None:
-
-        print(
-            "[preprocess debug] "
-            "perspective correction: QUAD"
-        )
-
-        tl, tr, br, bl = best_quad
-
-        width_top = np.linalg.norm(
-            tr - tl
-        )
-
-        width_bottom = np.linalg.norm(
-            br - bl
-        )
-
-        height_left = np.linalg.norm(
-            bl - tl
-        )
-
-        height_right = np.linalg.norm(
-            br - tr
-        )
-
-        output_width = int(
-            max(
-                width_top,
-                width_bottom
+            approx = cv2.approxPolyDP(
+                contour,
+                epsilon_factor * perimeter,
+                True
             )
-        )
 
-        output_height = int(
-            max(
-                height_left,
-                height_right
+            if len(approx) != 4:
+                continue
+
+            points = approx.reshape(
+                4,
+                2
+            ).astype(
+                np.float32
             )
-        )
 
-        output_width = max(
-            output_width,
-            240
-        )
+            if not cv2.isContourConvex(
+                    points.astype(
+                        np.int32
+                    )
+            ):
+                continue
 
-        output_height = max(
-            output_height,
-            int(output_width / 5.0)
-        )
+            ordered = _order_points(
+                points
+            )
 
-        destination = np.array(
+            tl, tr, br, bl = ordered
+
+            top_width = np.linalg.norm(
+                tr - tl
+            )
+
+            bottom_width = np.linalg.norm(
+                br - bl
+            )
+
+            left_height = np.linalg.norm(
+                bl - tl
+            )
+
+            right_height = np.linalg.norm(
+                br - tr
+            )
+
+            avg_width = (
+                                top_width
+                                + bottom_width
+                        ) / 2.0
+
+            avg_height = (
+                                 left_height
+                                 + right_height
+                         ) / 2.0
+
+            if avg_height <= 1:
+                continue
+
+            aspect = (
+                    avg_width
+                    / avg_height
+            )
+
+            # Broad range to tolerate perspective distortion.
+            if not (
+                    2.0 <= aspect <= 8.5
+            ):
+                continue
+
+            rectangle_area = (
+                    avg_width
+                    * avg_height
+            )
+
+            if rectangle_area <= 0:
+                continue
+
+            fill_ratio = (
+                    area
+                    / rectangle_area
+            )
+
+            if fill_ratio < 0.12:
+                continue
+
+            aspect_score = 1.0 - min(
+                abs(
+                    aspect - 4.5
+                ) / 4.5,
+                1.0
+            )
+
+            area_score = min(
+                area / image_area,
+                0.50
+            ) / 0.50
+
+            fill_score = min(
+                fill_ratio,
+                1.0
+            )
+
+            cx = float(
+                points[:, 0].mean()
+            )
+
+            cy = float(
+                points[:, 1].mean()
+            )
+
+            center_distance = np.sqrt(
+                (
+                        (cx - w / 2.0)
+                        / max(
+                    w / 2.0,
+                    1.0
+                )
+                ) ** 2
+                +
+                (
+                        (cy - h / 2.0)
+                        / max(
+                    h / 2.0,
+                    1.0
+                )
+                ) ** 2
+            )
+
+            center_score = 1.0 - min(
+                center_distance,
+                1.0
+            )
+
+            score = (
+                    area_score * 0.30
+                    + aspect_score * 0.30
+                    + fill_score * 0.25
+                    + center_score * 0.15
+            )
+
+            if score > best_score:
+
+                best_score = score
+                best_quad = ordered
+
+    return best_quad
+
+
+# ============================================================
+# PERSPECTIVE WARP
+# ============================================================
+
+def _warp_quad(
+        image,
+        quad
+):
+    """
+    Perspective rectify a detected plate quadrilateral.
+    """
+
+    if image is None:
+        return None
+
+    if quad is None:
+        return None
+
+    tl, tr, br, bl = quad
+
+    width_top = np.linalg.norm(
+        tr - tl
+    )
+
+    width_bottom = np.linalg.norm(
+        br - bl
+    )
+
+    height_left = np.linalg.norm(
+        bl - tl
+    )
+
+    height_right = np.linalg.norm(
+        br - tr
+    )
+
+    output_width = int(
+        max(
+            width_top,
+            width_bottom
+        )
+    )
+
+    output_height = int(
+        max(
+            height_left,
+            height_right
+        )
+    )
+
+    if output_width < 80:
+        return None
+
+    if output_height < 20:
+        return None
+
+    output_width = max(
+        output_width,
+        220
+    )
+
+    output_height = max(
+        output_height,
+        55
+    )
+
+    output_height = min(
+        output_height,
+        int(
+            output_width / 2.0
+        )
+    )
+
+    destination = np.array(
+        [
+            [0, 0],
             [
-                [0, 0],
-                [output_width - 1, 0],
-                [
-                    output_width - 1,
-                    output_height - 1
-                ],
-                [
-                    0,
-                    output_height - 1
-                ]
+                output_width - 1,
+                0
             ],
-            dtype=np.float32
-        )
+            [
+                output_width - 1,
+                output_height - 1
+            ],
+            [
+                0,
+                output_height - 1
+            ],
+        ],
+        dtype=np.float32
+    )
 
-        matrix = cv2.getPerspectiveTransform(
-            best_quad,
-            destination
-        )
+    matrix = cv2.getPerspectiveTransform(
+        quad.astype(
+            np.float32
+        ),
+        destination
+    )
 
-        corrected = cv2.warpPerspective(
-            plate_img,
-            matrix,
-            (
-                output_width,
-                output_height
+    return cv2.warpPerspective(
+        image,
+        matrix,
+        (
+            output_width,
+            output_height
+        ),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE
+    )
+
+
+# ============================================================
+# ROTATED RECTANGLE EXTRACTION
+# ============================================================
+
+def _find_rotated_plate(
+        image
+):
+    """
+    Try to detect the plate as a rotated rectangle.
+    """
+
+    if image is None:
+        return None
+
+    gray = _to_gray(
+        image
+    )
+
+    if gray is None:
+        return None
+
+    h, w = gray.shape[:2]
+
+    if w < 80 or h < 30:
+        return None
+
+    image_area = float(
+        w * h
+    )
+
+    best = None
+    best_score = -1.0
+
+    masks = _plate_masks(
+        gray,
+        image
+    )
+
+    for mask in masks:
+
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(
+                cv2.MORPH_RECT,
+                (9, 5)
             ),
-            flags=cv2.INTER_CUBIC,
-            borderMode=cv2.BORDER_REPLICATE
+            iterations=2
         )
 
-        return corrected
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
 
-    # ---------------------------------------------------------
-    # 3. FALLBACK: DETECT THE PLATE'S ROTATION ANGLE
-    # ---------------------------------------------------------
+        for contour in contours:
+
+            area = cv2.contourArea(
+                contour
+            )
+
+            if area < image_area * 0.015:
+                continue
+
+            if area > image_area * 0.85:
+                continue
+
+            rect = cv2.minAreaRect(
+                contour
+            )
+
+            (
+                (cx, cy),
+                (rw, rh),
+                angle
+            ) = rect
+
+            if rw <= 1 or rh <= 1:
+                continue
+
+            if rh > rw:
+
+                rw, rh = rh, rw
+                angle += 90.0
+
+            aspect = (
+                    rw / rh
+            )
+
+            if not (
+                    2.0 <= aspect <= 8.5
+            ):
+                continue
+
+            rectangle_area = (
+                    rw * rh
+            )
+
+            if rectangle_area <= 0:
+                continue
+
+            fill_ratio = (
+                    area
+                    / rectangle_area
+            )
+
+            if fill_ratio < 0.15:
+                continue
+
+            aspect_score = 1.0 - min(
+                abs(
+                    aspect - 4.5
+                ) / 4.5,
+                1.0
+            )
+
+            area_score = min(
+                area / image_area,
+                0.50
+            ) / 0.50
+
+            fill_score = min(
+                fill_ratio,
+                1.0
+            )
+
+            center_distance = np.sqrt(
+                (
+                        (cx - w / 2.0)
+                        / max(
+                    w / 2.0,
+                    1.0
+                )
+                ) ** 2
+                +
+                (
+                        (cy - h / 2.0)
+                        / max(
+                    h / 2.0,
+                    1.0
+                )
+                ) ** 2
+            )
+
+            center_score = 1.0 - min(
+                center_distance,
+                1.0
+            )
+
+            score = (
+                    area_score * 0.30
+                    + aspect_score * 0.30
+                    + fill_score * 0.25
+                    + center_score * 0.15
+            )
+
+            if score > best_score:
+
+                best_score = score
+
+                best = (
+                    float(cx),
+                    float(cy),
+                    float(rw),
+                    float(rh),
+                    float(angle)
+                )
+
+    if best is None:
+        return None
+
+    cx, cy, rw, rh, angle = best
+
+    # Safety margin.
+    rw *= 1.08
+    rh *= 1.18
+
+    box = cv2.boxPoints(
+        (
+            (cx, cy),
+            (rw, rh),
+            angle
+        )
+    )
+
+    box = _order_points(
+        box
+    )
+
+    corrected = _warp_quad(
+        image,
+        box
+    )
+
+    if corrected is None:
+        return None
+
+    print(
+        "[preprocess debug] "
+        f"rotated plate extracted angle={angle:.2f}"
+    )
+
+    return corrected
+
+
+# ============================================================
+# HOUGH ROTATION FALLBACK
+# ============================================================
+
+def _hough_rotation(
+        image
+):
+    """
+    Estimate dominant plate-like rotation using long lines.
+
+    This is a fallback only.
+    """
+
+    if image is None:
+        return None
+
+    gray = _to_gray(
+        image
+    )
+
+    if gray is None:
+        return None
+
+    h, w = gray.shape[:2]
+
+    if w < 80 or h < 30:
+        return None
 
     edges = cv2.Canny(
         gray,
@@ -356,21 +973,17 @@ def _perspective_correct(plate_img):
         1,
         np.pi / 180,
         threshold=max(
-            25,
-            int(w * 0.12)
+            20,
+            int(w * 0.10)
         ),
         minLineLength=max(
-            30,
-            int(w * 0.25)
+            25,
+            int(w * 0.22)
         ),
-        maxLineGap=20
+        maxLineGap=25
     )
 
     if lines is None:
-        print(
-            "[preprocess debug] "
-            "plate angle: not found"
-        )
         return None
 
     angles = []
@@ -378,9 +991,6 @@ def _perspective_correct(plate_img):
 
     for line in lines:
 
-        # HoughLinesP can return different array
-        # shapes depending on OpenCV/version.
-        # Flatten it so we always get x1,y1,x2,y2.
         coords = np.asarray(
             line
         ).reshape(-1)
@@ -399,8 +1009,8 @@ def _perspective_correct(plate_img):
         )
 
         if length < max(
-                30,
-                w * 0.20
+                25,
+                w * 0.18
         ):
             continue
 
@@ -411,9 +1021,7 @@ def _perspective_correct(plate_img):
             )
         )
 
-        # We are interested in long,
-        # roughly-horizontal plate edges.
-        if -35 <= angle <= 35:
+        if -30 <= angle <= 30:
 
             angles.append(
                 float(angle)
@@ -424,10 +1032,6 @@ def _perspective_correct(plate_img):
             )
 
     if not angles:
-        print(
-            "[preprocess debug] "
-            "plate angle: not found"
-        )
         return None
 
     angles = np.asarray(
@@ -440,8 +1044,6 @@ def _perspective_correct(plate_img):
         dtype=np.float32
     )
 
-    # Weighted average so long plate edges
-    # matter more than short edges.
     angle = float(
         np.average(
             angles,
@@ -449,411 +1051,705 @@ def _perspective_correct(plate_img):
         )
     )
 
-    # Ignore essentially straight plates.
     if abs(angle) < 2.0:
-        print(
-            "[preprocess debug] "
-            "plate angle: already straight"
-        )
         return None
 
-    # Don't perform extreme corrections.
-    if abs(angle) > 25:
-        print(
-            "[preprocess debug] "
-            f"plate angle rejected: {angle:.2f}"
-        )
+    if abs(angle) > 28.0:
         return None
+
+    correction = -angle
 
     print(
         "[preprocess debug] "
-        f"plate rotation detected: {angle:.2f} degrees, "
-        f"correcting with {-angle:.2f} degrees"
+        f"Hough angle={angle:.2f}, "
+        f"correction={correction:.2f}"
     )
 
-    center = (
-        w // 2,
-        h // 2
+    return _rotate_bound(
+        image,
+        correction
     )
 
-    matrix = cv2.getRotationMatrix2D(
-        center,
-        angle,
-        1.0
-    )
 
-    corrected = cv2.warpAffine(
-        plate_img,
-        matrix,
-        (w, h),
-        flags=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_REPLICATE
-    )
+# ============================================================
+# GEOMETRIC CANDIDATES
+# ============================================================
 
-    return corrected
-
-
-def _variants_from_crop(plate_img):
+def _geometric_candidates(
+        image
+):
     """
-    Existing preprocessing pipeline.
+    Generate genuinely different geometric representations.
     """
 
-    padded = cv2.copyMakeBorder(
-        plate_img,
-        top=10,
-        bottom=10,
-        left=15,
-        right=15,
-        borderType=cv2.BORDER_REPLICATE
-    )
+    candidates = []
 
-    gray = cv2.cvtColor(
-        padded,
-        cv2.COLOR_BGR2GRAY
-    )
+    if image is None:
+        return candidates
 
-    gray = _deskew(gray)
-
-    h, w = gray.shape[:2]
-
-    if w < 150:
-        scale = 8
-    elif w < 300:
-        scale = 6
-    else:
-        scale = 4
-
-    resized = cv2.resize(
-        gray,
-        None,
-        fx=scale,
-        fy=scale,
-        interpolation=cv2.INTER_CUBIC
-    )
-
-    blurred = cv2.GaussianBlur(
-        resized,
-        (3, 3),
-        0
-    )
-
-    enhanced = _adaptive_enhance(
-        blurred
-    )
-
-    variants = [
-        enhanced
-    ]
-
-    # ---------------------------------------------------------
-    # Adaptive threshold
-    # ---------------------------------------------------------
-
-    adaptive = cv2.adaptiveThreshold(
-        enhanced,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        15,
-        8
-    )
-
-    kernel_light = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (3, 3)
-    )
-
-    variants.append(
-        cv2.morphologyEx(
-            adaptive,
-            cv2.MORPH_CLOSE,
-            kernel_light,
-            iterations=1
+    candidates.append(
+        (
+            "original",
+            image
         )
     )
 
-    # ---------------------------------------------------------
-    # Otsu
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # Perspective correction
+    # --------------------------------------------------------
+
+    try:
+
+        quad = _find_plate_quad(
+            image
+        )
+
+        if quad is not None:
+
+            corrected = _warp_quad(
+                image,
+                quad
+            )
+
+            if corrected is not None:
+
+                print(
+                    "[preprocess debug] "
+                    "perspective correction: SUCCESS"
+                )
+
+                candidates.append(
+                    (
+                        "perspective",
+                        corrected
+                    )
+                )
+
+    except Exception as exc:
+
+        print(
+            "[preprocess debug] "
+            f"perspective correction failed: {exc}"
+        )
+
+    # --------------------------------------------------------
+    # Rotated rectangle
+    # --------------------------------------------------------
+
+    try:
+
+        corrected = _find_rotated_plate(
+            image
+        )
+
+        if corrected is not None:
+
+            candidates.append(
+                (
+                    "rotated_rect",
+                    corrected
+                )
+            )
+
+    except Exception as exc:
+
+        print(
+            "[preprocess debug] "
+            f"rotated rectangle failed: {exc}"
+        )
+
+    # --------------------------------------------------------
+    # Hough fallback
+    # --------------------------------------------------------
+
+    try:
+
+        corrected = _hough_rotation(
+            image
+        )
+
+        if corrected is not None:
+
+            candidates.append(
+                (
+                    "hough",
+                    corrected
+                )
+            )
+
+    except Exception as exc:
+
+        print(
+            "[preprocess debug] "
+            f"Hough correction failed: {exc}"
+        )
+
+    return candidates
+
+
+# ============================================================
+# OCR PREPROCESSING
+# ============================================================
+
+def _ocr_variants(
+        image,
+        compact=False
+):
+    """
+    Produce a small set of meaningful OCR representations.
+    """
+
+    if image is None:
+        return []
+
+    if image.size == 0:
+        return []
+
+    gray = _to_gray(
+        image
+    )
+
+    if gray is None:
+        return []
+
+    # --------------------------------------------------------
+    # Remove only a tiny outer border.
+    # --------------------------------------------------------
+
+    h, w = gray.shape[:2]
+
+    border_y = max(
+        2,
+        int(h * 0.04)
+    )
+
+    border_x = max(
+        2,
+        int(w * 0.02)
+    )
+
+    if (
+            h > border_y * 2
+            and w > border_x * 2
+    ):
+
+        gray = gray[
+            border_y:h - border_y,
+            border_x:w - border_x
+        ]
+
+    gray = _resize_for_ocr(
+        gray
+    )
+
+    enhanced = _adaptive_enhance(
+        gray
+    )
+
+    variants = []
+
+    # --------------------------------------------------------
+    # 1. Enhanced grayscale
+    # --------------------------------------------------------
+
+    variants.append(
+        enhanced
+    )
+
+    # --------------------------------------------------------
+    # 2. Otsu
+    # --------------------------------------------------------
 
     _, otsu = cv2.threshold(
         enhanced,
         0,
         255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        cv2.THRESH_BINARY +
+        cv2.THRESH_OTSU
     )
 
     variants.append(
         otsu
     )
 
-    # ---------------------------------------------------------
-    # Softer adaptive threshold
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # 3. Adaptive threshold
+    # --------------------------------------------------------
 
-    adaptive_soft = cv2.adaptiveThreshold(
+    adaptive = cv2.adaptiveThreshold(
         enhanced,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
-        31,
-        10
+        21,
+        7
     )
 
     variants.append(
-        adaptive_soft
+        adaptive
     )
 
-    # ---------------------------------------------------------
-    # Inverse adaptive threshold
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # 4. Sharpened grayscale
+    # --------------------------------------------------------
 
-    adaptive_inv = cv2.adaptiveThreshold(
-        enhanced,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        15,
-        8
-    )
+    if not compact:
 
-    variants.append(
-        cv2.morphologyEx(
-            adaptive_inv,
-            cv2.MORPH_CLOSE,
-            kernel_light,
-            iterations=1
+        blur = cv2.GaussianBlur(
+            enhanced,
+            (0, 0),
+            2
         )
+
+        sharpened = cv2.addWeighted(
+            enhanced,
+            1.4,
+            blur,
+            -0.4,
+            0
+        )
+
+        variants.append(
+            sharpened
+        )
+
+    return variants
+
+
+# ============================================================
+# IMAGE DEDUPLICATION
+# ============================================================
+
+def _deduplicate_images(
+        images,
+        threshold=3.0
+):
+    """
+    Remove visually near-identical images.
+
+    Supports:
+
+        image
+        (label, image)
+    """
+
+    unique = []
+
+    for item in images:
+
+        if (
+                isinstance(item, tuple)
+                and len(item) == 2
+        ):
+
+            label, image = item
+
+        else:
+
+            label = None
+            image = item
+
+        if image is None:
+            continue
+
+        if image.size == 0:
+            continue
+
+        gray = _to_gray(
+            image
+        )
+
+        if gray is None:
+            continue
+
+        small = cv2.resize(
+            gray,
+            (64, 24),
+            interpolation=cv2.INTER_AREA
+        )
+
+        duplicate = False
+
+        for existing_item in unique:
+
+            if (
+                    isinstance(
+                        existing_item,
+                        tuple
+                    )
+                    and len(existing_item) == 2
+            ):
+
+                existing_image = (
+                    existing_item[1]
+                )
+
+            else:
+
+                existing_image = (
+                    existing_item
+                )
+
+            existing_gray = _to_gray(
+                existing_image
+            )
+
+            if existing_gray is None:
+                continue
+
+            existing_small = cv2.resize(
+                existing_gray,
+                (64, 24),
+                interpolation=cv2.INTER_AREA
+            )
+
+            difference = float(
+                np.mean(
+                    cv2.absdiff(
+                        small,
+                        existing_small
+                    )
+                )
+            )
+
+            if difference < threshold:
+
+                duplicate = True
+                break
+
+        if not duplicate:
+
+            unique.append(
+                (
+                    label,
+                    image
+                )
+            )
+
+    return unique
+
+
+# ============================================================
+# FAST SCAN
+# ============================================================
+
+def _fast_variants(
+        plate_img
+):
+    """
+    Fast path:
+
+        original
+        perspective
+        rotated rectangle
+        Hough fallback
+
+    followed by a small OCR variant set.
+    """
+
+    geometric = _geometric_candidates(
+        plate_img
     )
 
-    # ---------------------------------------------------------
-    # Inverse Otsu
-    # ---------------------------------------------------------
-
-    _, otsu_inv = cv2.threshold(
-        enhanced,
-        0,
-        255,
-        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    geometric = _deduplicate_images(
+        geometric,
+        threshold=3.0
     )
 
-    variants.append(
-        otsu_inv
+    print(
+        "[preprocess debug] "
+        f"fast geometric candidates={len(geometric)}"
     )
 
-    # ---------------------------------------------------------
-    # Strong close
-    # ---------------------------------------------------------
+    variants = []
 
-    kernel_wide = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (5, 3)
-    )
+    for method, image in geometric:
 
-    strong_close = cv2.morphologyEx(
-        adaptive,
-        cv2.MORPH_CLOSE,
-        kernel_wide,
-        iterations=2
-    )
+        ocr_images = _ocr_variants(
+            image,
+            compact=False
+        )
 
-    variants.append(
-        strong_close
-    )
+        for ocr_image in ocr_images:
 
-    # ---------------------------------------------------------
-    # Sharpened Otsu
-    # ---------------------------------------------------------
+            variants.append(
+                (
+                    method,
+                    ocr_image
+                )
+            )
 
-    gaussian = cv2.GaussianBlur(
-        enhanced,
-        (0, 0),
-        3
-    )
-
-    sharpened = cv2.addWeighted(
-        enhanced,
-        1.5,
-        gaussian,
-        -0.5,
-        0
-    )
-
-    _, sharp_otsu = cv2.threshold(
-        sharpened,
-        0,
-        255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-
-    variants.append(
-        sharp_otsu
-    )
-
-    # ---------------------------------------------------------
-    # Denoised Otsu
-    # ---------------------------------------------------------
-
-    denoised = cv2.bilateralFilter(
-        enhanced,
-        9,
-        75,
-        75
-    )
-
-    _, denoised_otsu = cv2.threshold(
-        denoised,
-        0,
-        255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-
-    variants.append(
-        denoised_otsu
-    )
-
-    # ---------------------------------------------------------
-    # Small rotation nudge
-    # ---------------------------------------------------------
-
-    (h2, w2) = enhanced.shape[:2]
-
-    center2 = (
-        w2 // 2,
-        h2 // 2
-    )
-
-    M_pos = cv2.getRotationMatrix2D(
-        center2,
-        3,
-        1.0
-    )
-
-    nudged = cv2.warpAffine(
-        enhanced,
-        M_pos,
-        (w2, h2),
-        flags=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_REPLICATE
-    )
-
-    _, nudged_otsu = cv2.threshold(
-        nudged,
-        0,
-        255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-
-    variants.append(
-        nudged_otsu
+    variants = _deduplicate_images(
+        variants,
+        threshold=3.0
     )
 
     return variants
 
 
-def preprocess_plate_variants(plate_img):
-    """
-    Generate OCR variants from:
+# ============================================================
+# HARD RECOVERY
+# ============================================================
 
-    1. Original YOLO crop.
-    2. Perspective/rotation-corrected crop.
-    3. Super-resolved crop.
-    4. Super-resolved + corrected crop.
-
-    The original path is preserved so the new correction
-    cannot break images that already work.
-    """
-
-    variants = []
-
-    # =========================================================
-    # 1. ORIGINAL YOLO CROP
-    # =========================================================
-
-    original_variants = _variants_from_crop(
+def _hard_variants(
         plate_img
+):
+    """
+    Hard recovery.
+
+    IMPORTANT:
+
+    We first try to isolate/rectify the plate.
+
+    Only after those methods do we use the angle sweep.
+    """
+
+    sources = []
+
+    # --------------------------------------------------------
+    # Original
+    # --------------------------------------------------------
+
+    sources.append(
+        (
+            "original",
+            plate_img
+        )
     )
 
-    variants.extend(
-        original_variants
-    )
+    # --------------------------------------------------------
+    # Super resolution
+    # --------------------------------------------------------
 
-    # =========================================================
-    # 2. PERSPECTIVE / ROTATION CORRECTED CROP
-    # =========================================================
+    try:
 
-    corrected = _perspective_correct(
-        plate_img
-    )
+        sr = maybe_super_resolve(
+            plate_img
+        )
 
-    if corrected is not None:
+        if sr is not None:
+
+            print(
+                "[preprocess debug] "
+                "hard recovery: SR SUCCESS"
+            )
+
+            sources.append(
+                (
+                    "sr",
+                    sr
+                )
+            )
+
+    except Exception as exc:
 
         print(
             "[preprocess debug] "
-            "perspective correction: SUCCESS"
+            f"SR failed: {exc}"
         )
 
-        corrected_variants = _variants_from_crop(
-            corrected
+    # --------------------------------------------------------
+    # Geometry on original and SR
+    # --------------------------------------------------------
+
+    base_sources = list(
+        sources
+    )
+
+    for source_name, source in base_sources:
+
+        try:
+
+            geometric = _geometric_candidates(
+                source
+            )
+
+            for method, corrected in geometric:
+
+                if method == "original":
+                    continue
+
+                sources.append(
+                    (
+                        f"{source_name}_{method}",
+                        corrected
+                    )
+                )
+
+        except Exception as exc:
+
+            print(
+                "[preprocess debug] "
+                f"hard geometry failed: {exc}"
+            )
+
+    # --------------------------------------------------------
+    # Deduplicate before sweep.
+    # --------------------------------------------------------
+
+    sources = _deduplicate_images(
+        sources,
+        threshold=3.0
+    )
+
+    print(
+        "[preprocess debug] "
+        f"pre-sweep sources={len(sources)}"
+    )
+
+    # --------------------------------------------------------
+    # CONTROLLED ANGLE SWEEP
+    #
+    # Only sweep a small number of the best unique sources.
+    # --------------------------------------------------------
+
+    sweep_sources = sources[
+        :4
+    ]
+
+    sweep_angles = (
+        -24,
+        -18,
+        -12,
+        -6,
+        6,
+        12,
+        18,
+        24
+    )
+
+    for source_name, source in sweep_sources:
+
+        for angle in sweep_angles:
+
+            rotated = _rotate_bound(
+                source,
+                angle
+            )
+
+            if rotated is None:
+                continue
+
+            sources.append(
+                (
+                    f"{source_name}_angle_{angle}",
+                    rotated
+                )
+            )
+
+    # --------------------------------------------------------
+    # Remove repeated rotations.
+    # --------------------------------------------------------
+
+    sources = _deduplicate_images(
+        sources,
+        threshold=3.0
+    )
+
+    print(
+        "[preprocess debug] "
+        f"hard geometric candidates={len(sources)}"
+    )
+
+    # --------------------------------------------------------
+    # Compact OCR representations.
+    # --------------------------------------------------------
+
+    variants = []
+
+    for source_name, source in sources:
+
+        ocr_images = _ocr_variants(
+            source,
+            compact=True
         )
 
-        variants.extend(
-            corrected_variants
+        for ocr_image in ocr_images:
+
+            variants.append(
+                (
+                    source_name,
+                    ocr_image
+                )
+            )
+
+    variants = _deduplicate_images(
+        variants,
+        threshold=3.0
+    )
+
+    return variants
+
+
+# ============================================================
+# PUBLIC API
+# ============================================================
+
+def preprocess_plate_variants(
+        plate_img,
+        hard=False
+):
+    """
+    Public preprocessing interface.
+
+    hard=False:
+        FAST scan.
+
+    hard=True:
+        HARD recovery.
+    """
+
+    if plate_img is None:
+        return []
+
+    if plate_img.size == 0:
+        return []
+
+    if hard:
+
+        print(
+            "[preprocess debug] "
+            "ENTERING HARD RECOVERY"
+        )
+
+        variants = _hard_variants(
+            plate_img
         )
 
     else:
 
-        print(
-            "[preprocess debug] "
-            "perspective correction: not found"
+        variants = _fast_variants(
+            plate_img
         )
 
-    # =========================================================
-    # 3. SUPER RESOLUTION
-    # =========================================================
+    # The router expects plain image objects.
+    images = [
+        image
+        for _, image in variants
+    ]
 
-    sr_crop = maybe_super_resolve(
+    print(
+        "[preprocess debug] "
+        f"generated {len(images)} "
+        f"unique OCR variants"
+    )
+
+    return images
+
+
+def preprocess_plate(
+        plate_img
+):
+    """
+    Convenience function returning the first preprocessing
+    result.
+    """
+
+    variants = preprocess_plate_variants(
         plate_img
     )
 
-    if sr_crop is not None:
+    if not variants:
+        return plate_img
 
-        print(
-            "[preprocess debug] "
-            "super-resolution: SUCCESS"
-        )
-
-        variants.extend(
-            _variants_from_crop(
-                sr_crop
-            )
-        )
-
-        # -----------------------------------------------------
-        # 4. SUPER RESOLUTION + PERSPECTIVE CORRECTION
-        # -----------------------------------------------------
-
-        sr_corrected = _perspective_correct(
-            sr_crop
-        )
-
-        if sr_corrected is not None:
-
-            print(
-                "[preprocess debug] "
-                "SR perspective correction: SUCCESS"
-            )
-
-            variants.extend(
-                _variants_from_crop(
-                    sr_corrected
-                )
-            )
-
-    return variants
-
-
-def preprocess_plate(plate_img):
-    return preprocess_plate_variants(
-        plate_img
-    )[0]
+    return variants[0]
