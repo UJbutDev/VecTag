@@ -24,11 +24,26 @@ def insert_camera(camera_name: str, latitude: float, longitude: float):
     return response.data
 
 
-def get_detections_for_plate(plate_number: str):
+def get_plate_reference(plate_number: str):
+    response = (
+        supabase.table("plates_reference")
+        .select("*")
+        .eq("plate_number", plate_number)
+        .execute()
+    )
+    data = response.data
+    return data[0] if data else None
+
+
+def get_detections_by_matched_plate_id(matched_plate_id: int):
+    # Only pulls rows the fuzzy-matcher already confirmed belong to this
+    # vehicle (match_status = 'matched'), regardless of how noisy the raw
+    # OCR text was on any individual sighting.
     response = (
         supabase.table("plate_detections")
         .select("*, cameras(camera_name, latitude, longitude)")
-        .eq("cleaned_text", plate_number)
+        .eq("matched_plate_id", matched_plate_id)
+        .eq("match_status", "matched")
         .order("detected_at")
         .execute()
     )

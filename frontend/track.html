@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>VecTag - Vehicle Trajectory</title>
+    <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" />
+    <style>
+        :root {
+            --bg: #0b0d12; --text: #f2f3f5; --text-muted: #9099a8; --panel: rgba(22,25,32,0.72);
+            --panel-solid: #171a22; --border: rgba(255,255,255,0.08); --accent: #38bdf8; --glow: #22d3ee;
+        }
+        body.light-mode {
+            --bg: #eef1f5; --text: #14161a; --text-muted: #667085; --panel: rgba(255,255,255,0.75);
+            --panel-solid: #ffffff; --border: rgba(0,0,0,0.08); --accent: #0284c7; --glow: #0ea5e9;
+        }
+        body {
+            font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text);
+            display: flex; flex-direction: column;
+            padding: 16px; box-sizing: border-box; gap: 16px;
+        }
+        * { box-sizing: border-box; }
+        html, body { height: 100%; margin: 0; }
+
+        .icon { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; vertical-align: -3px; }
+
+        header {
+            flex: 0 0 auto; padding: 16px 28px; display: flex; justify-content: space-between; align-items: center;
+            background: var(--panel); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+            border: 1px solid var(--border); border-radius: 16px; position: relative; z-index: 10;
+        }
+        .brand { display: flex; flex-direction: column; gap: 10px; }
+        .brand h2 { margin: 0; font-weight: 600; font-size: 18px; letter-spacing: 0.2px; }
+
+        #controls { display: flex; gap: 12px; align-items: center; }
+        .search-pill {
+            display: flex; align-items: center; background: var(--panel-solid); border: 1px solid var(--border);
+            border-radius: 999px; padding: 4px 4px 4px 16px; width: 300px;
+        }
+        #plateInput {
+            border: none; outline: none; background: transparent; color: var(--text); font-size: 14px; flex: 1; padding: 8px 0;
+        }
+        #plateInput::placeholder { color: var(--text-muted); }
+        #trackBtn {
+            width: 36px; height: 36px; border-radius: 50%; border: none; cursor: pointer;
+            background: linear-gradient(135deg, var(--accent), var(--glow)); color: #06121a;
+            display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+            box-shadow: 0 0 12px rgba(56,189,248,0.5);
+        }
+        #trackBtn:hover { filter: brightness(1.1); }
+
+        .debug-tag {
+            display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-muted);
+            padding: 6px 12px; border: 1px dashed var(--border); border-radius: 999px; font-family: 'Consolas', monospace;
+        }
+        .debug-tag .dot { width: 6px; height: 6px; border-radius: 50%; background: #fbbf24; box-shadow: 0 0 6px #fbbf24; }
+
+        #themeToggle {
+            width: 40px; height: 40px; border-radius: 50%; cursor: pointer;
+            border: 1px solid var(--border); background: var(--panel-solid); color: var(--text);
+            display: flex; align-items: center; justify-content: center;
+        }
+        #themeToggle:hover { border-color: var(--accent); }
+
+        .map-wrap { position: relative; flex: 1; min-height: 0; border-radius: 16px; overflow: hidden; border: 1px solid var(--border); }
+        #map { position: absolute; inset: 0; }
+
+        .tilt-controls {
+            position: absolute; top: 20px; right: 380px; z-index: 5; display: flex; flex-direction: column; gap: 8px;
+        }
+        .tilt-controls button {
+            width: 36px; height: 36px; border-radius: 10px; border: 1px solid var(--border);
+            background: rgba(25,25,25,0.85); color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+        }
+        body.light-mode .tilt-controls button { background: rgba(255,255,255,0.85); color: #14161a; }
+
+        .legend {
+            position: absolute; bottom: 20px; left: 20px; z-index: 5;
+            background: var(--panel); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+            border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px;
+            font-size: 12px; color: var(--text-muted); display: flex; flex-direction: column; gap: 7px;
+            box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+        }
+        .legend-item { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+        .legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; border: 2px solid #fff; box-shadow: 0 0 4px rgba(0,0,0,0.4); }
+
+        #sidebar {
+            position: absolute; top: 20px; right: 20px; bottom: 20px; width: 340px;
+            background: var(--panel); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+            border: 1px solid var(--border); border-radius: 16px; padding: 20px; overflow-y: auto;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.02);
+            z-index: 4;
+        }
+        #sidebar::-webkit-scrollbar { width: 6px; }
+        #sidebar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 6px; }
+
+        .empty-state { color: var(--text-muted); font-size: 14px; margin-top: 60px; text-align: center; line-height: 1.6; }
+        .empty-state .icon { width: 28px; height: 28px; margin-bottom: 10px; opacity: 0.5; }
+
+        .plate-title { font-size: 20px; font-weight: 600; letter-spacing: 1px; margin: 2px 0 3px; }
+        .owner-line { color: var(--text-muted); font-size: 12px; margin-bottom: 10px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+        .status-badge {
+            display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 8px;
+            font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 12px;
+        }
+        .status-normal { background: rgba(74,222,128,0.12); color: #4ade80; border: 1px solid rgba(74,222,128,0.3); }
+        .status-stolen { background: rgba(248,113,113,0.14); color: #f87171; border: 1px solid rgba(248,113,113,0.35); }
+        .status-blacklisted {
+            background: linear-gradient(135deg, #7f1d1d, #b91c1c); color: #fff;
+            box-shadow: 0 0 16px rgba(239,68,68,0.55); border: 1px solid #ef4444;
+        }
+
+        .kpi-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 12px; }
+        .kpi-card {
+            background: rgba(255,255,255,0.04); border: 1px solid var(--border); border-radius: 10px;
+            padding: 6px 4px; text-align: center;
+        }
+        body.light-mode .kpi-card { background: rgba(0,0,0,0.03); }
+        .kpi-card .icon { width: 14px; height: 14px; color: var(--accent); margin-bottom: 3px; }
+        .kpi-value { font-size: 13px; font-weight: 700; line-height: 1.1; }
+        .kpi-label { font-size: 8px; color: var(--text-muted); margin-top: 1px; text-transform: uppercase; letter-spacing: 0.3px; }
+        .kpi-card.clickable { cursor: pointer; transition: background 0.15s, transform 0.15s; }
+        .kpi-card.clickable:hover { background: rgba(56,189,248,0.12); transform: translateY(-1px); }
+        .kpi-card.clickable .kpi-label { text-decoration: underline dotted; }
+
+        .info-row {
+            display: flex; justify-content: space-between; align-items: center; padding: 8px 2px;
+            border-bottom: 1px solid var(--border); font-size: 12.5px;
+        }
+        .info-row:last-child { border-bottom: none; }
+        .info-label { color: var(--text-muted); display: flex; align-items: center; gap: 7px; }
+        .info-label .icon { width: 14px; height: 14px; opacity: 0.8; }
+        .info-value { font-weight: 600; text-align: right; }
+
+        .sightings-detail-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+        .back-btn {
+            background: var(--panel-solid); border: 1px solid var(--border); color: var(--text);
+            border-radius: 8px; padding: 7px 12px; cursor: pointer; display: flex; align-items: center;
+            gap: 6px; font-size: 12px; font-weight: 600;
+        }
+        .back-btn:hover { border-color: var(--accent); }
+        .sightings-detail-title { font-weight: 600; font-size: 14px; }
+
+        .sighting-row { padding: 10px 2px; border-bottom: 1px solid var(--border); font-size: 12px; }
+        .sighting-row:last-child { border-bottom: none; }
+        .sighting-row .cam-name { font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 6px; }
+        .sighting-row .sighting-time { color: var(--text-muted); margin-top: 2px; }
+        .sighting-badge {
+            display: inline-block; font-size: 9px; padding: 2px 7px; border-radius: 6px;
+            text-transform: uppercase; letter-spacing: 0.3px; font-weight: 700;
+        }
+
+        .maplibregl-ctrl-group {
+            background: rgba(25,25,25,0.85) !important; border-radius: 10px !important; overflow: hidden;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.08) !important;
+        }
+        .maplibregl-ctrl-group button { background: transparent !important; filter: invert(1) brightness(1.9); }
+        .maplibregl-ctrl-group button:hover { background: rgba(255,255,255,0.12) !important; }
+        body.light-mode .maplibregl-ctrl-group { background: rgba(255,255,255,0.85) !important; }
+        body.light-mode .maplibregl-ctrl-group button { filter: none; }
+
+        .maplibregl-popup-content {
+            background: #14161c !important; color: #f2f3f5 !important; border-radius: 10px !important;
+            padding: 14px 16px !important; box-shadow: 0 8px 24px rgba(0,0,0,0.5) !important;
+            border: 1px solid rgba(255,255,255,0.08) !important;
+        }
+        .maplibregl-popup-tip { border-top-color: #14161c !important; }
+        .maplibregl-cooperative-gesture-screen { display: none !important; }
+
+        /* IMPORTANT: this must stay position: absolute. maplibregl.Marker adds
+           the "maplibregl-marker" class to any custom element you give it, and
+           its own stylesheet requires position: absolute for its coordinate
+           transform to work. A "position: relative" rule here has the same
+           specificity and, being declared later, silently wins the cascade —
+           which breaks marker placement (this caused the misplaced/rogue
+           marker bug). Do not change this back to relative. */
+        .pulse-marker { position: absolute; width: 20px; height: 20px; }
+        .pulse-dot {
+            position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%;
+            border: 2px solid #fff; box-shadow: 0 0 8px rgba(0,0,0,0.6); z-index: 2;
+        }
+        .pulse-ring {
+            position: absolute; inset: 0; border-radius: 50%; opacity: 0.65;
+            animation: pulseAnim 1.8s ease-out infinite; z-index: 1;
+        }
+        @keyframes pulseAnim {
+            0% { transform: scale(0.6); opacity: 0.7; }
+            100% { transform: scale(2.4); opacity: 0; }
+        }
+    </style>
+</head>
+<body>
+<header>
+    <div class="brand">
+        <h2>Vehicle Trajectory Tracker</h2>
+        <div id="controls">
+            <div class="search-pill">
+                <input type="text" id="plateInput" placeholder="Enter plate number e.g. M43CC174" />
+                <button id="trackBtn" onclick="loadTrajectory()" aria-label="Track">
+                    <svg class="icon" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+                </button>
+            </div>
+            <span class="debug-tag"><span class="dot"></span>Manual input — debug mode</span>
+        </div>
+    </div>
+    <button id="themeToggle" onclick="toggleTheme()" aria-label="Toggle theme">
+        <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+    </button>
+</header>
+
+<div class="map-wrap">
+    <div id="map"></div>
+    <div class="tilt-controls">
+        <button onclick="tiltUp()" aria-label="Tilt up"><svg class="icon" viewBox="0 0 24 24"><polyline points="18 15 12 9 6 15"/></svg></button>
+        <button onclick="tiltDown()" aria-label="Tilt down"><svg class="icon" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg></button>
+    </div>
+    <div class="legend">
+        <div class="legend-item"><span class="legend-dot" style="background:#2ecc71;"></span>Start point</div>
+        <div class="legend-item"><span class="legend-dot" style="background:#ef4444;"></span>Last seen</div>
+        <div class="legend-item"><span class="legend-dot" style="background:#f59e0b;"></span>Start &amp; last seen (same spot)</div>
+        <div class="legend-item"><span class="legend-dot" style="background:#38bdf8;"></span>Intermediate stop</div>
+    </div>
+    <div id="sidebar">
+        <div id="sidebarContent">
+            <div class="empty-state">
+                <svg class="icon" viewBox="0 0 24 24" style="display:block;margin:0 auto 10px;"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                Enter a plate number to view vehicle details and trajectory.
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+<script src="track.js"></script>
+</body>
+</html>
