@@ -25,6 +25,10 @@ from detection.ocr import (
     synthesize_voted_candidate
 )
 
+from detection.rapid_ocr import (
+    run_rapid_ocr
+)
+
 from detection.match import (
     find_best_match_across_candidates
 )
@@ -360,6 +364,121 @@ async def scan_plate(
                     "[router debug] "
                     f"crop save failed: {exc}"
                 )
+
+        # ====================================================
+        # RAPIDOCR PATH
+        # ====================================================
+        #
+        # RapidOCR is added to the SAME candidate pool used by
+        # detection.match. We do not modify match.py.
+        #
+        # A strong RapidOCR result can therefore identify a plate
+        # before FAST/HARD EasyOCR gets a chance to overwhelm the
+        # candidate pool with noisy single-character reads.
+        # ====================================================
+
+        print(
+            "[router debug] "
+            f"starting RapidOCR candidate scan for crop {crop_i}"
+        )
+
+        rapid_results = run_rapid_ocr(plate_crop)
+
+        for rapid_i, (
+                rapid_text,
+                rapid_confidence,
+                rapid_box
+        ) in enumerate(rapid_results):
+
+            if not rapid_text:
+                continue
+
+            print(
+                "[rapidocr] "
+                f"candidate text='{rapid_text}' "
+                f"conf={rapid_confidence}"
+            )
+
+            if rapid_box is not None:
+                print(
+                    "[rapidocr] "
+                    f"box={rapid_box}"
+                )
+
+            # Feed RapidOCR directly into the same matcher input
+            # format as EasyOCR: (raw_text, confidence).
+            ocr_candidates.append(
+                (
+                    rapid_text,
+                    rapid_confidence
+                )
+            )
+
+            rapid_candidate_number = (
+                    len(ocr_candidates) - 1
+            )
+
+            print(
+                "[router debug] "
+                f"candidate_{rapid_candidate_number}: "
+                f"RapidOCR raw='{rapid_text}' "
+                f"conf={rapid_confidence}"
+            )
+
+            # ----------------------------------------------------
+            # Immediate database cross-check.
+            # ----------------------------------------------------
+            #
+            # This is intentionally the existing matcher.
+            # We do NOT add RapidOCR-specific fuzzy rules here.
+            # ----------------------------------------------------
+
+            try:
+                rapid_match = _database_match(
+                    [(
+                        rapid_text,
+                        rapid_confidence
+                    )],
+                    reference_plates
+                )
+            except Exception as exc:
+                print(
+                    "[router debug] "
+                    f"RapidOCR database check failed: {exc}"
+                )
+                rapid_match = None
+
+            if rapid_match is not None:
+                (
+                    rapid_raw_text,
+                    rapid_cleaned_text,
+                    rapid_final_confidence,
+                    rapid_matched_plate,
+                    rapid_match_score,
+                    rapid_match_status
+                ) = rapid_match
+
+                if (
+                        rapid_match_status == "matched"
+                        and rapid_matched_plate is not None
+                ):
+                    print(
+                        "[router debug] "
+                        "EARLY RAPIDOCR DATABASE MATCH"
+                    )
+
+                    print(
+                        "[router debug] "
+                        f"matched_plate="
+                        f"'{rapid_matched_plate.get('plate_number')}' "
+                        f"score={rapid_match_score}"
+                    )
+
+                    early_match = rapid_match
+                    break
+
+        if early_match is not None:
+            break
 
         # ====================================================
         # FAST PATH
