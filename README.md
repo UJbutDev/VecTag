@@ -67,7 +67,7 @@ Single end-to-end endpoint: `POST /scan`. Given a camera image, it detects the p
 Owned and built independently by a teammate. Covers:
 - Camera location management
 - Reconstructing a vehicle's path across multiple camera detections over time
-- GIS map visualization (Leaflet.js)
+- GIS map visualization (MapbLibre GL JS)
 - Traffic analytics dashboard
 
 *(Implementation details are out of scope for this README's detection-side author — see the `trajectory` branch directly for specifics.)*
