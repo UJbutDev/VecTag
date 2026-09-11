@@ -67,7 +67,7 @@ Single end-to-end endpoint: `POST /scan`. Given a camera image, it detects the p
 Owned and built independently by a teammate. Covers:
 - Camera location management
 - Reconstructing a vehicle's path across multiple camera detections over time
-- GIS map visualization (MapbLibre GL JS)
+- GIS map visualization (MapLibre GL JS)
 - Traffic analytics dashboard
 
 *(Implementation details are out of scope for this README's detection-side author — see the `trajectory` branch directly for specifics.)*
@@ -80,7 +80,7 @@ Owned and built independently by a teammate. Covers:
 |---|---|
 | Backend | Python, FastAPI |
 | Database | Supabase (hosted PostgreSQL) — shared instance |
-| Frontend | Plain HTML/CSS/JS, Leaflet.js |
+| Frontend | Plain HTML/CSS/JS, MapLibre GL JS |
 | Detection | Ultralytics YOLOv8 |
 | OCR | EasyOCR |
 | Fuzzy matching | RapidFuzz |
